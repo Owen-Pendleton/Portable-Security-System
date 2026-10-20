@@ -33,7 +33,8 @@ camera then captures a short clip as evidence for confirmed events.
 ## The mechanisms
 - B (interrupt-driven input): the PIR is read via a GPIO edge interrupt,
   compared head-to-head against polling for latency and CPU cost, since
-  a battery-conscious portable device shouldn't spin on a pin.
+  spinning on a pin that rarely changes takes CPU from the audio analysis
+  running on the same Pi.
 - D (custom storage layer): event clips and the event log must survive a
   power cut mid-write and must not fill the SD card, so we need explicit
   retention, write batching, and a crash-recovery story.
