@@ -2,7 +2,7 @@
 #define PSS_STORE_CLIP_H
 
 /*
- * Mechanism D, clip store (Design.md §5): a burst is written into
+ * Mechanism D, clip store (DESIGN.md Section 5): a burst is written into
  * clips/<id>.dir.tmp, then committed by fsync(files) -> fsync(tmp dir) ->
  * rename to clips/<id>.dir -> fsync(clips/). Anything still named *.tmp at
  * startup is an interrupted write and is deleted.
@@ -21,6 +21,8 @@ int clip_commit(int clips_dir_fd, uint64_t event_id, uint32_t *n_images);
 int clip_discard(int clips_dir_fd, uint64_t event_id);
 /* Removes every *.tmp entry (file or one-level dir), logging each. 0 or -1. */
 int clip_cleanup_tmp(int clips_dir_fd, uint32_t *removed);
+/* Number of *.jpg in committed clips/<id>.dir (0 if it doesn't exist). 0 or -1. */
+int clip_count_images(int clips_dir_fd, uint64_t event_id, uint32_t *n_images);
 /* Highest <id> among committed clips/<id>.dir (0 if none). 0 or -1. */
 int clip_max_id(int clips_dir_fd, uint64_t *max_id);
 

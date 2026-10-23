@@ -1,5 +1,5 @@
 /*
- * micd: USB microphone capture + feature extraction (Design.md §2, §4).
+ * micd: USB microphone capture + feature extraction (DESIGN.md Section 2, Section 4).
  *
  * Two threads joined by an SPSC ring: the capture thread blocks in
  * snd_pcm_readi() and pushes 20 ms chunks; the main thread wakes on an
@@ -11,7 +11,7 @@
  * the Blue Snowball, which has not arrived.
  *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on error, 2 on usage, 3 when the
- * device disappears (unplugged), per Design.md §6.
+ * device disappears (unplugged), per DESIGN.md Section 6.
  */
 #include "capture/mic/features.h"
 #include "common/client.h"

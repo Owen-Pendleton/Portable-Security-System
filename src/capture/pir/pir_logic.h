@@ -3,7 +3,7 @@
 
 /*
  * Hardware-independent part of pird, so it is testable off the Pi.
- * HC-SR501 false-triggers for ~60 s after power-up (Design.md §6), so edges in
+ * HC-SR501 false-triggers for ~60 s after power-up (DESIGN.md Section 6), so edges in
  * that window are not forwarded; repeated edges in the same direction (e.g.
  * a missed edge in poll mode) are dropped so the hub sees a clean rise/fall
  * sequence.

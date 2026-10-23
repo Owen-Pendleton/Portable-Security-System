@@ -2,7 +2,7 @@
 #define PSS_CAPTURE_FEATURES_H
 
 /*
- * Per-frame audio features (Design.md §4): 1024-point Hann window every
+ * Per-frame audio features (DESIGN.md Section 4): 1024-point Hann window every
  * 20 ms (882 samples at 44.1 kHz); RMS, log energy in 8 log-spaced bands
  * from 100 Hz to 8 kHz, and spectral flux (sum of positive band increases).
  * Our own radix-2 FFT; no libraries.

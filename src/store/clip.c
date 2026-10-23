@@ -195,6 +195,34 @@ int clip_cleanup_tmp(int clips_dir_fd, uint32_t *removed)
 	return ret;
 }
 
+int clip_count_images(int clips_dir_fd, uint64_t event_id, uint32_t *n_images)
+{
+	char final[48];
+	struct dirlist dl;
+	int fd, ret = -1;
+
+	*n_images = 0;
+	if (clip_final_name(final, sizeof final, event_id) != 0)
+		return -1;
+	fd = openat(clips_dir_fd, final, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0) {
+		if (errno == ENOENT)
+			return 0;
+		pss_log("clip: open %s: %s", final, strerror(errno));
+		return -1;
+	}
+	if (dirlist_read(fd, &dl) == 0) {
+		for (size_t i = 0; i < dl.n; i++)
+			if (has_suffix(dl.names[i], ".jpg"))
+				(*n_images)++;
+		dirlist_free(&dl);
+		ret = 0;
+	}
+	if (close(fd) != 0)
+		pss_log("clip: close %s: %s", final, strerror(errno));
+	return ret;
+}
+
 int clip_max_id(int clips_dir_fd, uint64_t *max_id)
 {
 	struct dirlist dl;

@@ -1,5 +1,5 @@
 /*
- * camd: Arducam OV5647 evidence bursts (Design.md §2). On CAM_TRIGGER from the
+ * camd: Arducam OV5647 evidence bursts (DESIGN.md Section 2). On CAM_TRIGGER from the
  * hub it runs `rpicam-still --timelapse` into clips/<id>.dir.tmp and reports
  * CAM_DONE. The hub, not camd, commits or discards the burst (single writer).
  *

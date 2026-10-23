@@ -1,5 +1,5 @@
 /*
- * hub: the single writer (Design.md §2). Accepts sensor daemons on
+ * hub: the single writer (DESIGN.md Section 2). Accepts sensor daemons on
  * $PSS_RUN_DIR/hub.sock, turns PIR edges into events, asks camd for an image
  * burst per event, and commits everything through the store (mechanism D).
  *
@@ -35,7 +35,7 @@
 #define HB_EVERY_NS (60 * PSS_NS_PER_S)
 #define HB_STALE_NS (15 * PSS_NS_PER_S)
 #define BURST_SLACK_NS (20 * PSS_NS_PER_S)
-#define BURST_EST_BYTES (9ull * 1024 * 1024)	/* upper end of Design.md §5's 6-9 MB */
+#define BURST_EST_BYTES (9ull * 1024 * 1024)	/* upper end of DESIGN.md Section 5's 6-9 MB */
 
 enum { TAG_LISTEN = MAX_CONNS, TAG_SIG, TAG_TICK };
 
@@ -165,7 +165,7 @@ static int close_event(struct hub *h, int64_t end_ns, uint32_t extra_flags)
 	r.flags = ev->flags | extra_flags;
 	r.pir_edges = ev->pir_edges;
 	r.n_images = ev->n_images;
-	if (store_append(&h->store, PSS_REC_EVENT, &r, sizeof r) != 0 || store_sync(&h->store) != 0) {
+	if (store_event_close(&h->store, &r) != 0) {
 		pss_log("event %" PRIu64 ": store write failed; exiting so recovery runs", ev->id);
 		return -1;
 	}
@@ -357,7 +357,8 @@ static int write_stats(struct hub *h, int64_t now)
 	for (uint32_t role = PSS_ROLE_PIR; role <= PSS_ROLE_MIC; role++)
 		if (role_alive(h, role, now))
 			r.sensors_ok |= 1u << role;
-	if (store_append(&h->store, PSS_REC_STATS, &r, sizeof r) != 0 || store_sync(&h->store) != 0)
+	if (store_append(&h->store, PSS_LOG_STATS, PSS_REC_STATS, &r, sizeof r) != 0 ||
+	    store_sync(&h->store, PSS_LOG_STATS) != 0)
 		return -1;
 	pss_log("hb: up=%" PRId64 "s pird=%s camd=%s micd=%s edges=%" PRIu64 " events=%" PRIu64
 		" bursts=%" PRIu64 " cam_fail=%" PRIu64 " mic_frames=%" PRIu64,
@@ -396,7 +397,8 @@ static int write_boot(struct hub *h)
 	b.boot_no = h->store.boot_no + 1;
 	b.mono_ns = pss_mono_ns();
 	b.wall_ns = pss_wall_ns();
-	if (store_append(&h->store, PSS_REC_BOOT, &b, sizeof b) != 0 || store_sync(&h->store) != 0)
+	if (store_append(&h->store, PSS_LOG_EVENTS, PSS_REC_BOOT, &b, sizeof b) != 0 ||
+	    store_sync(&h->store, PSS_LOG_EVENTS) != 0)
 		return -1;
 	h->store.boot_no = b.boot_no;
 	pss_log("boot #%" PRIu64 " recorded; next event id %" PRIu64, b.boot_no, h->store.next_event_id);

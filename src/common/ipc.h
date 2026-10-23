@@ -2,7 +2,7 @@
 #define PSS_COMMON_IPC_H
 
 /*
- * Daemon <-> hub messages over AF_UNIX SOCK_SEQPACKET (Design.md §2): one
+ * Daemon <-> hub messages over AF_UNIX SOCK_SEQPACKET (DESIGN.md Section 2): one
  * fixed-size struct per packet, so boundaries are preserved and a dead peer
  * shows up as EOF/EPIPE. All processes run on the same Pi, so the struct is
  * sent in native layout.

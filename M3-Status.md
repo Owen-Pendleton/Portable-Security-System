@@ -8,29 +8,34 @@ The Blue Snowball microphone has **not arrived yet**. The M3 demo therefore
 uses the **PIR (HC-SR501) and the camera (Arducam OV5647)** as its two
 sensors. `micd` is written and its feature extraction is unit-tested on
 synthetic signals, but it has **not been run on real microphone hardware**.
-Fusion of PIR and audio (Design.md §4) needs the mic and data we collect, so
+Fusion of PIR and audio (DESIGN.md Section 4) needs the mic and data we collect, so
 it is planned for M4. Until then, every PIR-triggered event is recorded as
 `MOTION_ONLY` and tagged `audio-offline`, and every successful camera burst is
-kept. (Once fusion exists, Design.md §5 deletes unconfirmed bursts.)
+kept. (Once fusion exists, DESIGN.md Section 5 deletes unconfirmed bursts.)
 
 ## What the demo shows
 ```
 wave at PIR -> pird (GPIO edge interrupt, B) -> hub -> event opened
                                               -> camd -> rpicam-still burst -> clips/<id>.dir.tmp
             hub commits the burst atomically (fsync, rename, fsync dir; D) -> clips/<id>.dir
-            hub writes a CRC-framed event record + fdatasync (D) -> log/seg-000001.pel
+            hub writes a CRC-framed event record + fdatasync (D) -> events/seg-NNNNNN.pel
+            (per-minute stats go to a separate log, stats/seg-NNNNNN.pel)
 pss events  -> reads the record back from disk
 ```
 - **Mechanism B (interrupt-driven input):** `pird` blocks until the kernel
   delivers a GPIO edge with a CLOCK_MONOTONIC timestamp, and logs the
   edge-to-userspace latency per edge. `--poll=<ms>` is the polling arm for
   the head-to-head comparison.
-- **Mechanism D (storage layer):** append-only CRC32-framed log with
-  torn-tail recovery at startup; atomic clip commit; deletion of `*.tmp`
-  left by interrupted writes; oldest-first quota with a free-space floor.
-  Power-pull demo: pull the plug mid-burst, boot, and restart. The hub logs
-  `store: recovered seg=N valid=R truncated_bytes=B` and removes the
-  interrupted clip.
+- **Mechanism D (storage layer):** separate append-only CRC32-framed event
+  and stats logs with torn-tail recovery at startup; ENTRY records made
+  durable when the entry opens, and any entry left open by a power cut
+  closed as `interrupted (power lost)`; stats segments deleted whole after
+  7 days; atomic clip commit; deletion of `*.tmp` left by interrupted
+  writes; oldest-first clip quota with a free-space floor. Power-pull demo:
+  pull the plug mid-burst, boot, and restart. The hub logs
+  `store: recovered events seg=N valid=R truncated_bytes=B` and removes the
+  interrupted clip. (ENTRY events themselves need fusion, M4; the store
+  side is done and tested.)
 
 ## Running it on the Pi
 ```

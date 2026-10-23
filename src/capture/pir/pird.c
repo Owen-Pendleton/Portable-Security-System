@@ -1,5 +1,5 @@
 /*
- * pird: HC-SR501 PIR on a Pi 5 GPIO line (mechanism B, Design.md §3).
+ * pird: HC-SR501 PIR on a Pi 5 GPIO line (mechanism B, DESIGN.md Section 3).
  *
  * Default (IRQ) mode requests the line with both-edge detection and kernel
  * CLOCK_MONOTONIC timestamps, then sleeps in poll() until the GPIO interrupt
@@ -7,7 +7,7 @@
  * it is the comparison arm for the B measurements.
  *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on error, 2 on usage, 3 when the GPIO
- * chip disappears (supervisor treats 3 as "device gone", Design.md §3 E).
+ * chip disappears (supervisor treats 3 as "device gone", DESIGN.md Section 3, mechanism E).
  */
 #include "capture/pir/pir_logic.h"
 #include "common/client.h"

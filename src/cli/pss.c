@@ -1,5 +1,5 @@
 /*
- * pss: user CLI (Design.md §7). M3 has `pss events`, which reads the event log
+ * pss: user CLI (DESIGN.md Section 7). M3 has `pss events`, which reads the event log
  * straight from disk (read-only, through the store's scanner). The hub query
  * socket and timeline/status/health come later.
  */
@@ -17,16 +17,20 @@
 #include <time.h>
 #include <unistd.h>
 
+#define MAX_OPEN 16
+
 struct print_ctx {
 	int clips_fd;
 	int all;
 	uint64_t events, boots, stats, unknown;
+	struct pss_rec_event_open open[MAX_OPEN];	/* ENTRYs opened, not yet closed */
+	size_t n_open, open_overflow;
 };
 
 static void usage(void)
 {
 	fprintf(stderr, "usage: pss events [--all] [--data=DIR]\n"
-			"  --all   also show per-minute stats records\n"
+			"  --all   also show per-minute stats records (after the events)\n"
 			"  --data  data directory (default $PSS_DATA_DIR or /var/lib/pss)\n");
 }
 
@@ -63,20 +67,35 @@ static int print_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *
 		struct pss_rec_event ev;
 
 		memcpy(&ev, p, sizeof ev);
+		for (size_t i = 0; i < c->n_open; i++) {
+			if (c->open[i].event_id == ev.event_id) {
+				c->open[i] = c->open[--c->n_open];
+				break;
+			}
+		}
 		fmt_wall(when, sizeof when, ev.start_wall_ns);
-		fmt_dur(dur, sizeof dur, ev.end_mono_ns - ev.start_mono_ns);
+		if (ev.flags & PSS_EVF_INTERRUPTED)
+			snprintf(dur, sizeof dur, "?");
+		else
+			fmt_dur(dur, sizeof dur, ev.end_mono_ns - ev.start_mono_ns);
 		if (ev.n_images > 0 && clip_final_name(clip, sizeof clip, ev.event_id) == 0)
 			snprintf(where, sizeof where, faccessat(c->clips_fd, clip, F_OK, 0) == 0
 				 ? "clips/%s" : "clips/%s (evicted)", clip);
 		else
 			snprintf(where, sizeof where, "-");
-		printf("%s  %-7s #%-4" PRIu64 " %7s  edges=%-3" PRIu32 " images=%-3" PRIu32 " %s%s%s%s\n",
+		printf("%s  %-7s #%-4" PRIu64 " %7s  edges=%-3" PRIu32 " images=%-3" PRIu32 " %s%s%s%s%s\n",
 		       when, ev.kind == PSS_EV_MOTION_ONLY ? "MOTION" : ev.kind == PSS_EV_ENTRY ? "ENTRY" : "SOUND",
 		       ev.event_id, dur, ev.pir_edges, ev.n_images, where,
 		       (ev.flags & PSS_EVF_NO_IMAGES) ? "  [no-images]" : "",
 		       (ev.flags & PSS_EVF_AUDIO_OFFLINE) ? "  [audio-offline]" : "",
-		       (ev.flags & PSS_EVF_CLOSED_AT_SHUTDOWN) ? "  [closed-at-shutdown]" : "");
+		       (ev.flags & PSS_EVF_CLOSED_AT_SHUTDOWN) ? "  [closed-at-shutdown]" : "",
+		       (ev.flags & PSS_EVF_INTERRUPTED) ? "  [interrupted (power lost)]" : "");
 		c->events++;
+	} else if (type == PSS_REC_EVENT_OPEN && len == sizeof(struct pss_rec_event_open)) {
+		if (c->n_open < MAX_OPEN)
+			memcpy(&c->open[c->n_open++], p, sizeof c->open[0]);
+		else
+			c->open_overflow++;
 	} else if (type == PSS_REC_BOOT && len == sizeof(struct pss_rec_boot)) {
 		struct pss_rec_boot b;
 
@@ -140,13 +159,24 @@ int main(int argc, char **argv)
 	if (c.clips_fd < 0)
 		fprintf(stderr, "pss: %s: %s (clip status unknown)\n", clips, strerror(errno));
 
-	r = store_scan(data, print_visitor, &c);
+	r = store_scan(data, PSS_LOG_EVENTS, print_visitor, &c);
 	if (c.clips_fd >= 0)
 		close(c.clips_fd);
 	if (r != 0) {
 		fprintf(stderr, "pss: could not read the event log in %s\n", data);
 		return 1;
 	}
+	for (size_t i = 0; i < c.n_open; i++) {
+		char when[32];
+
+		fmt_wall(when, sizeof when, c.open[i].start_wall_ns);
+		printf("%s  %-7s #%-4" PRIu64 " IN PROGRESS\n", when,
+		       c.open[i].kind == PSS_EV_ENTRY ? "ENTRY" : "EVENT", c.open[i].event_id);
+	}
+	if (c.open_overflow > 0)
+		printf("(%zu more open events not shown)\n", c.open_overflow);
+	if (c.all && store_scan(data, PSS_LOG_STATS, print_visitor, &c) != 0)
+		fprintf(stderr, "pss: could not read the stats log in %s\n", data);
 	printf("-- %" PRIu64 " events, %" PRIu64 " boots, %" PRIu64 " stats records%s\n",
 	       c.events, c.boots, c.stats, c.unknown ? " (some records of unknown type skipped)" : "");
 	return 0;

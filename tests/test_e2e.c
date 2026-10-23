@@ -121,7 +121,7 @@ static void run_session(const char *data, struct seen *out)
 	snprintf(hub, sizeof hub, "%s/hub", bindir);
 	snprintf(camd, sizeof camd, "%s/camd", bindir);
 	if (access(data, F_OK) == 0)
-		CHECK(store_scan(data, seen_visitor, &before) == 0);
+		CHECK(store_scan(data, PSS_LOG_EVENTS, seen_visitor, &before) == 0);
 
 	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20", NULL });
 	CHECK(hp > 0);
@@ -144,7 +144,7 @@ static void run_session(const char *data, struct seen *out)
 	/* Event closes after the burst returns and 300 ms of quiet (1 s tick). */
 	for (int i = 0; i < 100; i++) {
 		memset(out, 0, sizeof *out);
-		CHECK(store_scan(data, seen_visitor, out) == 0);
+		CHECK(store_scan(data, PSS_LOG_EVENTS, seen_visitor, out) == 0);
 		if (out->events > before.events)
 			break;
 		sleep_ms(100);
@@ -201,6 +201,10 @@ static void test_pir_to_storage(void)
 	CHECK(s.last.end_mono_ns >= s.last.start_mono_ns);
 	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, first_id);
 	CHECK(count_entries(path, ".jpg") == 3);
+	snprintf(path, sizeof path, "%s/stats", data);
+	CHECK(count_entries(path, ".pel") >= 1);	/* stats log lives apart from events */
+	snprintf(path, sizeof path, "%s/events", data);
+	CHECK(count_entries(path, ".pel") == 1);
 
 	/* Session 2: same data dir, camera fails. Ids continue, boot count grows. */
 	setenv("FAKE_RPICAM_FAIL", "1", 1);

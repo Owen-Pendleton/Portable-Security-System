@@ -3,7 +3,7 @@
 
 /*
  * Sensor-daemon side of the hub connection: connect with backoff, say HELLO,
- * and drop (and count) messages while the hub is away (Design.md §6, hub row).
+ * and drop (and count) messages while the hub is away (DESIGN.md Section 6, hub row).
  */
 
 #include "common/ipc.h"
