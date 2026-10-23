@@ -1,0 +1,6 @@
+-std=c17
+-D_GNU_SOURCE
+-Wall
+-Wextra
+-Wvla
+-Isrc
