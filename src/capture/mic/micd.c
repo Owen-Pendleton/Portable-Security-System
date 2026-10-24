@@ -133,6 +133,44 @@ static void *capture_main(void *arg)
 	return NULL;
 }
 
+/*
+ * snd_pcm_set_params() sets start_threshold to the whole buffer (8820
+ * frames). The kernel only auto-starts capture when one read asks for at
+ * least that many frames, and we read one 882-frame hop at a time, so the
+ * stream never started and each read timed out with -EIO (seen on the Pi
+ * with strace). Start on the first frame, like arecord. Returns 0 or 1.
+ */
+static int set_start_threshold(snd_pcm_t *pcm, const char *device)
+{
+	snd_pcm_sw_params_t *sw = NULL;
+	int r, code = 1;
+
+	r = snd_pcm_sw_params_malloc(&sw);
+	if (r < 0) {
+		pss_log("snd_pcm_sw_params_malloc: %s", snd_strerror(r));
+		goto out;
+	}
+	r = snd_pcm_sw_params_current(pcm, sw);
+	if (r < 0) {
+		pss_log("snd_pcm_sw_params_current %s: %s", device, snd_strerror(r));
+		goto out;
+	}
+	r = snd_pcm_sw_params_set_start_threshold(pcm, sw, 1);
+	if (r < 0) {
+		pss_log("snd_pcm_sw_params_set_start_threshold %s: %s", device, snd_strerror(r));
+		goto out;
+	}
+	r = snd_pcm_sw_params(pcm, sw);
+	if (r < 0) {
+		pss_log("snd_pcm_sw_params %s: %s", device, snd_strerror(r));
+		goto out;
+	}
+	code = 0;
+out:
+	snd_pcm_sw_params_free(sw);
+	return code;
+}
+
 /* Returns 0, or an exit code. */
 static int open_pcm(struct micd *m, const char *device)
 {
@@ -150,7 +188,7 @@ static int open_pcm(struct micd *m, const char *device)
 		pss_log("snd_pcm_set_params %s (s16 mono %d Hz): %s", device, RATE, snd_strerror(r));
 		return 1;
 	}
-	return 0;
+	return set_start_threshold(m->pcm, device);
 }
 
 static void send_heartbeat(struct pss_client *cl, struct micd *m, uint64_t frames)
