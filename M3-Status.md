@@ -78,7 +78,29 @@ with a stand-in camera script, with the test itself sending PIR edges in
 place of `pird`, and (`test_sound_to_storage`) synthetic mic frames in place
 of `micd`: 10 s of steady fan noise plus a slow 9.5 dB fan ramp store no
 event, then one clap frame stores exactly one `SOUND_ONLY` event with its
-images. **Not yet verified on the Pi:** `pird` with the real PIR,
-`rpicam-still` burst arguments, `micd` on the Blue Snowball, and the live
-clap -> `pss events` demo. (Pending; this section is updated with the real
-Pi output once run.)
+images. 
+## Verified on the Pi (2026-10-23)
+- `arecord -l`: `card 2: Snowball [Blue Snowball]`; 5 s record + playback OK.
+  `/proc/asound/Snowball/stream0`: S16_LE, mono, 44100 Hz native.
+- **micd bug found and fixed on hardware.** First runs failed every time with
+  `snd_pcm_readi: Input/output error; exit 3` ~220 ms after start, while
+  `arecord` with the same settings worked. strace showed the kernel read
+  waiting 1.1 x the 200 ms buffer and returning EIO: capture never started.
+  Cause: `snd_pcm_set_params()` sets `start_threshold` to the whole buffer
+  (8820 frames) and micd reads 882-frame hops, so the kernel never
+  auto-started; `arecord -v` showed `start_threshold: 1`. Fixed in e2de0c1.
+- `deploy/run-m3.sh --mic --mic-device=plughw:CARD=Snowball --no-pir`:
+  `hb: up=5s pird=absent camd=ok micd=ok ... mic_frames=295 mic_onsets=0
+  mic_zmax=1.6 mic_dbmax=2.2` (room background, well under the thresholds).
+- Clap: `sound onset: flux z=58.8, +43.2 dB over background` ->
+  `event 1 opened (sound onset)` -> `rpicam-still` burst -> `pss events`:
+  ```
+  2026-10-23 19:19:25  SOUND  #1  31s  edges=0  images=17  clips/1.dir
+  2026-10-23 19:20:42  SOUND  #2   0s  edges=0  images=18  clips/2.dir
+  ```
+- Open items: bursts asked for 20 frames and got 17-18 (`rpicam-still
+  --timelapse` drops some); `pss events` reported `0 stats records` on later
+  runs although stats are written each minute (store, to investigate); `pird`
+  with the real PIR still not verified (not wired). One `arecord` run briefly
+  reported the Snowball missing (`Cannot get card index`) and it returned
+  17 s later; watching for USB drop-outs.
