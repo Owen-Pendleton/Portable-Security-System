@@ -4,6 +4,9 @@
  * part of pird by sending PIR edge messages over the hub socket. The live
  * demo uses the real pird and rpicam-still on the Pi; this checks the
  * pipeline and storage around them.
+ *
+ * test_sound_to_storage plays micd the same way: steady fan-like frames that
+ * must not trigger, then one clap frame that must open a SOUND_ONLY event.
  */
 #include "t.h"
 
@@ -14,6 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -220,6 +224,115 @@ static void test_pir_to_storage(void)
 	t_rm_rf(root);
 }
 
+/* Uniform in [-1, 1), deterministic so the test is repeatable. */
+static double lcg_unit(uint32_t *st)
+{
+	*st = *st * 1664525u + 1013904223u;
+	return (double)(*st >> 8) / (double)(1u << 23) - 1.0;
+}
+
+static void send_mic_frame(int fd, double rms, double flux)
+{
+	struct pss_msg m;
+
+	pss_msg_init(&m, PSS_MSG_MIC_FRAME);
+	m.u.mic.rms = (float)rms;
+	m.u.mic.flux = (float)flux;
+	for (int b = 0; b < PSS_NBANDS; b++)
+		m.u.mic.band[b] = (float)log10(rms * rms);
+	for (int i = 0; i < 500; i++) {
+		if (ipc_send(fd, &m) == 0)
+			return;
+		if (errno != EAGAIN)
+			break;
+		sleep_ms(1);	/* socket buffer full: let the hub drain it */
+	}
+	CHECK(!"send_mic_frame failed");
+}
+
+/* Fan-like noise: level rms_lvl with +-10% jitter, flux 0.3 +- 0.1. */
+static void send_fan(int fd, uint32_t *st, double rms_lvl)
+{
+	send_mic_frame(fd, rms_lvl * (1.0 + 0.1 * lcg_unit(st)), 0.3 + 0.1 * lcg_unit(st));
+}
+
+static int count_events(const char *data, struct seen *out)
+{
+	memset(out, 0, sizeof *out);
+	CHECK(store_scan(data, PSS_LOG_EVENTS, seen_visitor, out) == 0);
+	return out->events;
+}
+
+static void test_sound_to_storage(void)
+{
+	char root[256], data[300], run[300], fake[512], path[600], hub[512], camd[512], sock[300];
+	const char *bindir = getenv("PSS_BIN_DIR");
+	struct pss_msg m;
+	struct seen s = { 0 };
+	uint32_t st = 12345;
+	pid_t hp, cp;
+	int fd, i;
+
+	t_mkdtemp(root);
+	snprintf(data, sizeof data, "%s/data", root);
+	snprintf(run, sizeof run, "%s/run", root);
+	snprintf(fake, sizeof fake, "%s/fake-rpicam-still.sh", getenv("PSS_TEST_DIR"));
+	CHECK(chmod(fake, 0755) == 0);
+	setenv("PSS_DATA_DIR", data, 1);
+	setenv("PSS_RUN_DIR", run, 1);
+	setenv("PSS_RPICAM", fake, 1);
+	unsetenv("FAKE_RPICAM_FAIL");
+	snprintf(hub, sizeof hub, "%s/hub", bindir);
+	snprintf(camd, sizeof camd, "%s/camd", bindir);
+
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
+			       "--warmup-frames=250", "--onset-z=6", "--onset-db=10", NULL });
+	CHECK(hp > 0);
+	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
+	fd = connect_retry(sock);
+	CHECK(fd >= 0);
+	cp = spawn((char *[]){ camd, NULL });
+	CHECK(cp > 0);
+
+	/* Act as micd. */
+	pss_msg_init(&m, PSS_MSG_HELLO);
+	m.u.hello.role = PSS_ROLE_MIC;
+	m.u.hello.pid = (uint32_t)getpid();
+	CHECK(ipc_send(fd, &m) == 0);
+	sleep_ms(1000); /* let camd connect */
+
+	/* 10 s of a steady fan, then the fan slowly turned up ~9.5 dB over 30 s. */
+	for (i = 0; i < 500; i++)
+		send_fan(fd, &st, 0.02);
+	for (i = 0; i < 1500; i++)
+		send_fan(fd, &st, 0.02 * (1.0 + 2.0 * i / 1500.0));
+	sleep_ms(1500); /* past a 1 s tick, so any event would have closed */
+	CHECK(count_events(data, &s) == 0);
+
+	/* A clap: broadband jump (big flux, ~+18 dB), then the fan again. */
+	send_mic_frame(fd, 0.5, 5.0);
+	for (i = 0; i < 100; i++)
+		send_fan(fd, &st, 0.06);
+	for (i = 0; i < 100 && count_events(data, &s) == 0; i++)
+		sleep_ms(100);
+	CHECK(s.events == 1);
+	CHECK(s.last.kind == PSS_EV_SOUND_ONLY);
+	CHECK(s.last.pir_edges == 0);
+	CHECK(s.last.n_images == 3);
+	CHECK(!(s.last.flags & PSS_EVF_NO_IMAGES));
+	CHECK(!(s.last.flags & PSS_EVF_AUDIO_OFFLINE));
+	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, s.last.event_id);
+	CHECK(count_entries(path, ".jpg") == 3);
+	snprintf(path, sizeof path, "%s/clips", data);
+	CHECK(count_entries(path, ".tmp") == 0);
+
+	CHECK(stop(cp) == 0);
+	CHECK(stop(hp) == 0);
+	close(fd);
+	CHECK(count_events(data, &s) == 1); /* nothing left open at shutdown */
+	t_rm_rf(root);
+}
+
 int main(void)
 {
 	if (getenv("PSS_BIN_DIR") == NULL || getenv("PSS_TEST_DIR") == NULL) {
@@ -227,5 +340,6 @@ int main(void)
 		return 2;
 	}
 	T_RUN(test_pir_to_storage);
+	T_RUN(test_sound_to_storage);
 	T_END();
 }

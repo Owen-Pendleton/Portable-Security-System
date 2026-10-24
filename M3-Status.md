@@ -4,18 +4,30 @@
 real storage; at least one menu mechanism working; transcripts copied out.
 
 ## Sensor substitution for this checkpoint
-The Blue Snowball microphone has **not arrived yet**. The M3 demo therefore
-uses the **PIR (HC-SR501) and the camera (Arducam OV5647)** as its two
-sensors. `micd` is written and its feature extraction is unit-tested on
-synthetic signals, but it has **not been run on real microphone hardware**.
-Fusion of PIR and audio (DESIGN.md Section 4) needs the mic and data we collect, so
-it is planned for M4. Until then, every PIR-triggered event is recorded as
-`MOTION_ONLY` and tagged `audio-offline`, and every successful camera burst is
-kept. (Once fusion exists, DESIGN.md Section 5 deletes unconfirmed bursts.)
+The PIR (HC-SR501) is **not wired** yet (no jumper wires), so the M3 demo
+uses the **microphone (Blue Snowball) and the camera (Arducam OV5647)** as its
+two sensors. The final design is still PIR + mic (DESIGN.md Section 4); this
+swap is for the M3 demo only. The PIR path (`pird`) is still built and its
+end-to-end test still runs.
+
+**M3 sound trigger (in `hub`, stand-in for the M4 detectors).** `micd` sends
+features every 20 ms. The hub keeps an EWMA background model (60 s time
+constant) of spectral flux and log RMS, learned only while no event is open.
+A frame is a sound onset when **both** its flux z-score is >= `--onset-z`
+(default 6) **and** it is >= `--onset-db` (default 10 dB) louder than the
+learned background, after `--warmup-frames` (default 250 = 5 s). Steady
+noise (fans, AC) does not trigger: its flux stays near its own learned mean
+and its level *is* the background; slow changes are absorbed by the EWMA.
+An onset with no event open opens a `SOUND_ONLY` event and fires a camera
+burst; later onsets extend it; it closes after `--quiet-ms` with no onsets.
+**The thresholds are placeholders** until tuned on Pi recordings: the hub's
+heartbeat line logs `mic_zmax` / `mic_dbmax` (largest scores per minute
+outside events) for that. Fusion with the PIR is M4.
 
 ## What the demo shows
 ```
-wave at PIR -> pird (GPIO edge interrupt, B) -> hub -> event opened
+clap        -> micd (ALSA, our FFT features) -> hub background model -> onset -> SOUND_ONLY event opened
+wave at PIR -> pird (GPIO edge interrupt, B) -> hub -> MOTION_ONLY event opened (when wired)
                                               -> camd -> rpicam-still burst -> clips/<id>.dir.tmp
             hub commits the burst atomically (fsync, rename, fsync dir; D) -> clips/<id>.dir
             hub writes a CRC-framed event record + fdatasync (D) -> events/seg-NNNNNN.pel
@@ -41,7 +53,9 @@ pss events  -> reads the record back from disk
 ```
 make deploy PI=pi@<host>          # copy the tree and build natively (needs libgpiod >= 2, ALSA)
 ssh pi@<host>
-cd pss && deploy/run-m3.sh        # hub + camd + pird; add --line=N if the PIR is not on GPIO17
+arecord -l                        # find the Snowball's card name
+cd pss && deploy/run-m3.sh --mic --mic-device=plughw:CARD=<name> --no-pir   # M3: mic + camera
+# (PIR wired: deploy/run-m3.sh, add --line=N if the PIR is not on GPIO17)
 build/pss events                  # in another terminal: what has been stored
 ```
 Check the GPIO chip and line first with `gpioinfo`. Depending on the kernel,
@@ -50,7 +64,8 @@ The PIR ignores edges for its first 60 s (sensor warm-up); `--warmup=0` skips
 this for a quick check.
 
 ## Not in M3 (next milestones)
-- Fusion FSM, detectors, background model (M4, needs the mic).
+- Fusion FSM and the DESIGN.md Section 4 detectors (impulse, voice) in
+  `src/analysis` (M4); the M3 sound trigger in `hub` is replaced then.
 - Supervisor (mechanism E) and `make soakcheck`.
 - Hub query socket; `pss timeline / status / health / expect / settime`.
 
@@ -60,5 +75,10 @@ this for a quick check.
 machines (no libgpiod), so it builds on the Pi. It was compile-checked
 against the libgpiod v2.1 header. `tests/test_e2e` runs the real hub and camd
 with a stand-in camera script, with the test itself sending PIR edges in
-place of `pird`. **Not yet verified on the Pi:** `pird` with the real PIR,
-`rpicam-still` burst arguments, and `micd` (no microphone yet).
+place of `pird`, and (`test_sound_to_storage`) synthetic mic frames in place
+of `micd`: 10 s of steady fan noise plus a slow 9.5 dB fan ramp store no
+event, then one clap frame stores exactly one `SOUND_ONLY` event with its
+images. **Not yet verified on the Pi:** `pird` with the real PIR,
+`rpicam-still` burst arguments, `micd` on the Blue Snowball, and the live
+clap -> `pss events` demo. (Pending; this section is updated with the real
+Pi output once run.)

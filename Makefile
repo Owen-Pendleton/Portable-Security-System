@@ -54,7 +54,7 @@ $(BUILD)/obj/capture/pir/pird.o: CFLAGS += $(shell pkg-config --cflags libgpiod 
 $(BUILD)/obj/capture/mic/micd.o: CFLAGS += $(shell pkg-config --cflags alsa 2>/dev/null)
 
 $(BUILD)/hub: $(call obj,hub/hub $(COMMON) $(STORE))
-	$(CC) $(LDFLAGS) $^ -o $@
+	$(CC) $(LDFLAGS) $^ -o $@ -lm
 
 $(BUILD)/camd: $(call obj,capture/cam/camd $(COMMON) store/dirlist store/clip)
 	$(CC) $(LDFLAGS) $^ -o $@
