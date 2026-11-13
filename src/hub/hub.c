@@ -3,9 +3,11 @@
  * $PSS_RUN_DIR/hub.sock, turns PIR edges into events, asks camd for an image
  * burst per event, and commits everything through the store (mechanism D).
  *
- * M3 scope: no fusion yet (needs collected data, M4). A PIR rise opens a
- * MOTION_ONLY event; a sound onset (below) with no PIR opens a SOUND_ONLY
- * event. Every successful burst is kept.
+ * Fusion (DESIGN.md Section 4, src/analysis/fusion.c): a PIR rise opens a
+ * MOTION_ONLY event and a sound onset (below) opens a SOUND_ONLY event, but
+ * neither takes images. Only when a rise and an onset fall within +-T_co of
+ * each other (either order) does the event become an ENTRY: it is made
+ * durable at once and camd is asked for a burst, once per event.
  *
  * M3 sound trigger (stand-in for DESIGN.md Section 4's detectors, M4): an
  * EWMA background model of spectral flux and log RMS, learned only while no
@@ -17,6 +19,7 @@
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on error (including any store write
  * failure, so the supervisor restarts us and recovery runs), 2 on usage.
  */
+#include "analysis/fusion.h"
 #include "common/ipc.h"
 #include "common/log.h"
 #include "common/time.h"
@@ -62,6 +65,7 @@ enum burst_state { BURST_NONE, BURST_PENDING, BURST_DONE };
 struct event {
 	int open;
 	uint64_t id;
+	uint32_t kind;		/* PSS_EV_ENTRY once confirmed; else set at close */
 	int64_t start_mono_ns;
 	int64_t start_wall_ns;
 	int64_t last_activity_ns;
@@ -88,10 +92,12 @@ struct hub {
 	struct conn conns[MAX_CONNS];
 	struct event ev;
 	struct mic_bg mic;
+	struct fusion fu;
+	int fatal;		/* a store write failed inside a handler: exit so recovery runs */
 	int64_t start_ns, next_hb_ns;
 	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_onsets;
 	/* config */
-	int64_t quiet_ns;
+	int64_t quiet_ns, t_co_ns;
 	uint32_t burst_frames, burst_interval_ms, floor_pct;
 	uint64_t quota_bytes;
 	double onset_z, onset_db;
@@ -105,7 +111,7 @@ static void usage(void)
 {
 	fprintf(stderr, "usage: hub [--quiet-ms=30000] [--burst-frames=20] [--burst-interval-ms=500]\n"
 			"           [--quota-mb=2048] [--floor-pct=5]\n"
-			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250]\n");
+			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250] [--t-co-ms=5000]\n");
 }
 
 static struct conn *conn_for_role(struct hub *h, uint32_t role)
@@ -172,6 +178,32 @@ static void open_event(struct hub *h, int64_t ts, int64_t now, int pir)
 	if (!role_alive(h, PSS_ROLE_MIC, now))
 		ev->flags |= PSS_EVF_AUDIO_OFFLINE;
 	pss_log("event %" PRIu64 " opened (%s)", ev->id, pir ? "PIR rise" : "sound onset");
+}
+
+/* Motion and sound coincided (dt_ns = onset time - rise time): the open
+ * event becomes an ENTRY, durable at once, and only now is the camera
+ * fired. Once per event. On a store failure sets h->fatal. */
+static void confirm_entry(struct hub *h, int64_t dt_ns, int64_t now)
+{
+	struct event *ev = &h->ev;
+	struct pss_rec_event_open o;
+
+	if (ev->kind == PSS_EV_ENTRY)
+		return;
+	ev->kind = PSS_EV_ENTRY;
+	memset(&o, 0, sizeof o);
+	o.event_id = ev->id;
+	o.start_mono_ns = ev->start_mono_ns;
+	o.start_wall_ns = ev->start_wall_ns;
+	o.kind = PSS_EV_ENTRY;
+	o.flags = ev->flags;
+	if (store_event_open(&h->store, &o) != 0) {
+		pss_log("event %" PRIu64 ": store write failed; exiting so recovery runs", ev->id);
+		h->fatal = 1;
+		return;
+	}
+	pss_log("event %" PRIu64 ": ENTRY confirmed (motion+sound, sound %+.1fs from motion)",
+		ev->id, (double)dt_ns / PSS_NS_PER_S);
 	trigger_burst(h, now);
 }
 
@@ -186,7 +218,10 @@ static int close_event(struct hub *h, int64_t end_ns, uint32_t extra_flags)
 	r.start_mono_ns = ev->start_mono_ns;
 	r.end_mono_ns = end_ns;
 	r.start_wall_ns = ev->start_wall_ns;
-	r.kind = ev->pir_edges > 0 ? PSS_EV_MOTION_ONLY : PSS_EV_SOUND_ONLY;
+	if (ev->kind == PSS_EV_ENTRY)
+		r.kind = PSS_EV_ENTRY;
+	else
+		r.kind = ev->pir_edges > 0 ? PSS_EV_MOTION_ONLY : PSS_EV_SOUND_ONLY;
 	r.flags = ev->flags | extra_flags;
 	r.pir_edges = ev->pir_edges;
 	r.n_images = ev->n_images;
@@ -195,7 +230,7 @@ static int close_event(struct hub *h, int64_t end_ns, uint32_t extra_flags)
 		return -1;
 	}
 	pss_log("event %" PRIu64 " closed: %s dur=%.1fs edges=%" PRIu32 " images=%" PRIu32 "%s%s",
-		ev->id, r.kind == PSS_EV_MOTION_ONLY ? "MOTION_ONLY" : "SOUND_ONLY", (double)(end_ns - ev->start_mono_ns) / PSS_NS_PER_S, r.pir_edges, r.n_images,
+		ev->id, r.kind == PSS_EV_ENTRY ? "ENTRY" : r.kind == PSS_EV_MOTION_ONLY ? "MOTION_ONLY" : "SOUND_ONLY", (double)(end_ns - ev->start_mono_ns) / PSS_NS_PER_S, r.pir_edges, r.n_images,
 		(r.flags & PSS_EVF_NO_IMAGES) ? " no-images" : "",
 		(r.flags & PSS_EVF_AUDIO_OFFLINE) ? " audio-offline" : "");
 	h->events_closed++;
@@ -236,16 +271,21 @@ static void on_cam_done(struct hub *h, const struct pss_msg *m)
 static void on_pir_edge(struct hub *h, const struct pss_msg *m, int64_t now)
 {
 	struct event *ev = &h->ev;
+	int64_t dt = 0;
 
 	h->pir_edges++;
 	if (m->u.pir.rising) {
+		int hit = fusion_rise(&h->fu, m->mono_ns, &dt);
+
 		if (!ev->open) {
 			open_event(h, m->mono_ns, now, 1);
-			return;
+		} else {
+			ev->pir_edges++;
+			ev->pir_high = 1;
+			ev->last_activity_ns = now;
 		}
-		ev->pir_edges++;
-		ev->pir_high = 1;
-		ev->last_activity_ns = now;
+		if (hit)
+			confirm_entry(h, dt, now);
 	} else if (ev->open) {
 		ev->pir_high = 0;
 		ev->last_activity_ns = now;
@@ -293,12 +333,17 @@ static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 			b->db_max = db;
 	}
 	if (onset) {
+		int64_t dt = 0;
+		int hit = fusion_onset(&h->fu, m->mono_ns, &dt);
+
 		h->mic_onsets++;
 		pss_log("sound onset: flux z=%.1f, +%.1f dB over background", z, db);
 		if (!ev->open)
 			open_event(h, m->mono_ns, now, 0);
 		else
 			ev->last_activity_ns = now;
+		if (hit)
+			confirm_entry(h, dt, now);
 		return;
 	}
 	if (!ev->open)
@@ -319,10 +364,14 @@ static void conn_drop(struct hub *h, int idx, const char *why)
 		h->ev.flags |= PSS_EVF_NO_IMAGES;
 		h->cam_failures++;
 	}
-	if (c->role == PSS_ROLE_PIR)
+	if (c->role == PSS_ROLE_PIR) {
 		h->ev.pir_high = 0; /* don't hold an event open on a dead sensor */
-	if (c->role == PSS_ROLE_MIC)
+		fusion_forget(&h->fu, 1, 0);
+	}
+	if (c->role == PSS_ROLE_MIC) {
 		memset(&h->mic, 0, sizeof h->mic); /* relearn: the device or room may differ */
+		fusion_forget(&h->fu, 0, 1);
+	}
 	c->fd = -1;
 	c->role = PSS_ROLE_NONE;
 }
@@ -510,10 +559,11 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		{ "onset-z", required_argument, NULL, 'z' },
 		{ "onset-db", required_argument, NULL, 'd' },
 		{ "warmup-frames", required_argument, NULL, 'w' },
+		{ "t-co-ms", required_argument, NULL, 'T' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
-	uint32_t quiet_ms = 30000, quota_mb = 2048, v;
+	uint32_t quiet_ms = 30000, quota_mb = 2048, t_co_ms = 5000, v;
 	int opt;
 
 	h->burst_frames = 20;
@@ -534,10 +584,13 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		case 'z': if (v < 1 || v > 1000) return -1; h->onset_z = v; break;
 		case 'd': if (v > 120) return -1; h->onset_db = v; break;
 		case 'w': if (v < 1) return -1; h->mic_warmup = v; break;
+		case 'T': if (v < 1 || v > 60000) return -1; t_co_ms = v; break;
 		default: return -1;
 		}
 	}
 	h->quiet_ns = (int64_t)quiet_ms * PSS_NS_PER_MS;
+	h->t_co_ns = (int64_t)t_co_ms * PSS_NS_PER_MS;
+	fusion_init(&h->fu, h->t_co_ns);
 	h->quota_bytes = (uint64_t)quota_mb * 1024 * 1024;
 	return 0;
 }
@@ -588,9 +641,10 @@ int main(int argc, char **argv)
 
 	h->start_ns = pss_mono_ns();
 	h->next_hb_ns = h->start_ns + HB_FIRST_NS;
-	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms onset z>=%.0f +%.0fdB warmup=%" PRIu32,
+	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms onset z>=%.0f +%.0fdB warmup=%" PRIu32 " t_co=%" PRId64 "ms",
 		(int)getpid(), pss_data_dir(), h->sock_path, h->quiet_ns / PSS_NS_PER_MS,
-		h->burst_frames, h->burst_interval_ms, h->onset_z, h->onset_db, h->mic_warmup);
+		h->burst_frames, h->burst_interval_ms, h->onset_z, h->onset_db, h->mic_warmup,
+		h->t_co_ns / PSS_NS_PER_MS);
 
 	for (;;) {
 		struct epoll_event evs[16];
@@ -630,6 +684,8 @@ int main(int argc, char **argv)
 			} else if (tag < MAX_CONNS) {
 				conn_readable(h, (int)tag, now);
 			}
+			if (h->fatal)
+				goto out;
 		}
 	}
 out:

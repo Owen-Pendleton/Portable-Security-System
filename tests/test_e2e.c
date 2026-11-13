@@ -7,6 +7,10 @@
  *
  * test_sound_to_storage plays micd the same way: steady fan-like frames that
  * must not trigger, then one clap frame that must open a SOUND_ONLY event.
+ *
+ * Fusion (DESIGN.md Section 4): motion alone and sound alone are logged but
+ * take no images. test_entry_to_storage plays both pird and micd: a PIR rise
+ * and a clap within T_co make an ENTRY, the only kind that fires the camera.
  */
 #include "t.h"
 
@@ -26,9 +30,10 @@
 #include <unistd.h>
 
 struct seen {
-	int boots, events;
+	int boots, events, opens;
 	uint64_t max_boot;
 	struct pss_rec_event last;
+	struct pss_rec_event_open last_open;
 };
 
 static int seen_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *p, uint32_t len, void *arg)
@@ -40,6 +45,9 @@ static int seen_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *p
 	if (type == PSS_REC_EVENT && len == sizeof s->last) {
 		memcpy(&s->last, p, sizeof s->last);
 		s->events++;
+	} else if (type == PSS_REC_EVENT_OPEN && len == sizeof s->last_open) {
+		memcpy(&s->last_open, p, sizeof s->last_open);
+		s->opens++;
 	} else if (type == PSS_REC_BOOT && len == sizeof(struct pss_rec_boot)) {
 		struct pss_rec_boot b;
 
@@ -192,30 +200,32 @@ static void test_pir_to_storage(void)
 	setenv("PSS_RUN_DIR", run, 1);
 	setenv("PSS_RPICAM", fake, 1);
 
-	/* Session 1: camera works. */
+	/* Session 1: motion alone is logged as MOTION_ONLY and takes no images
+	 * (the camera is for confirmed entries only; see test_entry_to_storage). */
 	unsetenv("FAKE_RPICAM_FAIL");
 	run_session(data, &s);
 	first_id = s.last.event_id;
 	CHECK(s.boots == 1 && s.max_boot == 1);
 	CHECK(s.last.kind == PSS_EV_MOTION_ONLY);
-	CHECK(s.last.n_images == 3);
-	CHECK(!(s.last.flags & PSS_EVF_NO_IMAGES));
+	CHECK(s.last.n_images == 0);
+	CHECK(!(s.last.flags & PSS_EVF_NO_IMAGES));	/* no burst was asked for, none failed */
 	CHECK(s.last.flags & PSS_EVF_AUDIO_OFFLINE); /* no micd running */
 	CHECK(s.last.pir_edges == 1);
 	CHECK(s.last.end_mono_ns >= s.last.start_mono_ns);
+	CHECK(s.opens == 0);
 	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, first_id);
-	CHECK(count_entries(path, ".jpg") == 3);
+	CHECK(count_entries(path, ".jpg") == -1);	/* no clip directory at all */
 	snprintf(path, sizeof path, "%s/stats", data);
 	CHECK(count_entries(path, ".pel") >= 1);	/* stats log lives apart from events */
 	snprintf(path, sizeof path, "%s/events", data);
 	CHECK(count_entries(path, ".pel") == 1);
 
-	/* Session 2: same data dir, camera fails. Ids continue, boot count grows. */
-	setenv("FAKE_RPICAM_FAIL", "1", 1);
+	/* Session 2: same data dir. Ids continue, boot count grows. (The camera
+	 * failure case moved to test_entry_to_storage: only an ENTRY bursts.) */
 	run_session(data, &s);
 	CHECK(s.boots == 2 && s.max_boot == 2);
 	CHECK(s.last.event_id == first_id + 1);
-	CHECK(s.last.flags & PSS_EVF_NO_IMAGES);
+	CHECK(s.last.kind == PSS_EV_MOTION_ONLY);
 	CHECK(s.last.n_images == 0);
 
 	snprintf(path, sizeof path, "%s/clips", data);
@@ -318,11 +328,12 @@ static void test_sound_to_storage(void)
 	CHECK(s.events == 1);
 	CHECK(s.last.kind == PSS_EV_SOUND_ONLY);
 	CHECK(s.last.pir_edges == 0);
-	CHECK(s.last.n_images == 3);
+	CHECK(s.last.n_images == 0);	/* sound alone takes no images */
 	CHECK(!(s.last.flags & PSS_EVF_NO_IMAGES));
 	CHECK(!(s.last.flags & PSS_EVF_AUDIO_OFFLINE));
+	CHECK(s.opens == 0);
 	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, s.last.event_id);
-	CHECK(count_entries(path, ".jpg") == 3);
+	CHECK(count_entries(path, ".jpg") == -1);	/* no clip directory at all */
 	snprintf(path, sizeof path, "%s/clips", data);
 	CHECK(count_entries(path, ".tmp") == 0);
 
@@ -330,6 +341,141 @@ static void test_sound_to_storage(void)
 	CHECK(stop(hp) == 0);
 	close(fd);
 	CHECK(count_events(data, &s) == 1); /* nothing left open at shutdown */
+	t_rm_rf(root);
+}
+
+static int connect_as(const char *sock, uint32_t role)
+{
+	struct pss_msg m;
+	int fd = connect_retry(sock);
+
+	CHECK(fd >= 0);
+	pss_msg_init(&m, PSS_MSG_HELLO);
+	m.u.hello.role = role;
+	m.u.hello.pid = (uint32_t)getpid();
+	CHECK(ipc_send(fd, &m) == 0);
+	return fd;
+}
+
+/* Waits (up to 10 s) until the events log holds n complete events. */
+static void wait_events(const char *data, int n, struct seen *s)
+{
+	for (int i = 0; i < 100 && count_events(data, s) < n; i++)
+		sleep_ms(100);
+	CHECK(s->events == n);
+}
+
+/* Checks the newest event is a confirmed ENTRY with 3 images on disk. */
+static void check_entry_with_images(const char *data, const struct seen *s)
+{
+	char path[600];
+
+	CHECK(s->last.kind == PSS_EV_ENTRY);
+	CHECK(s->last.n_images == 3);
+	CHECK(!(s->last.flags & PSS_EVF_NO_IMAGES));
+	CHECK(s->last_open.event_id == s->last.event_id);	/* made durable when confirmed */
+	CHECK(s->last_open.kind == PSS_EV_ENTRY);
+	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, s->last.event_id);
+	CHECK(count_entries(path, ".jpg") == 3);
+}
+
+/*
+ * One hub+camd lifetime with the test acting as both pird and micd.
+ * T_co is 500 ms here. cam_fail: run only case (a), with the camera failing.
+ */
+static void entry_session(const char *data, int cam_fail)
+{
+	char hub[512], camd[512], sock[300], path[600];
+	const char *bindir = getenv("PSS_BIN_DIR");
+	struct seen s = { 0 };
+	uint32_t st = 777;
+	pid_t hp, cp;
+	int pfd, mfd, n0, i;
+
+	snprintf(hub, sizeof hub, "%s/hub", bindir);
+	snprintf(camd, sizeof camd, "%s/camd", bindir);
+	if (cam_fail)
+		setenv("FAKE_RPICAM_FAIL", "1", 1);
+	else
+		unsetenv("FAKE_RPICAM_FAIL");
+	n0 = access(data, F_OK) == 0 ? count_events(data, &s) : 0;
+
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
+			       "--warmup-frames=50", "--t-co-ms=500", NULL });
+	CHECK(hp > 0);
+	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
+	pfd = connect_as(sock, PSS_ROLE_PIR);
+	mfd = connect_as(sock, PSS_ROLE_MIC);
+	cp = spawn((char *[]){ camd, NULL });
+	CHECK(cp > 0);
+	sleep_ms(1000);	/* let camd connect */
+	for (i = 0; i < 100; i++)	/* learn the room background */
+		send_fan(mfd, &st, 0.02);
+
+	/* (a) Door: latch sound first, then the person walks into view. */
+	send_mic_frame(mfd, 0.5, 5.0);
+	sleep_ms(100);
+	send_edge(pfd, 1);
+	sleep_ms(50);
+	send_edge(pfd, 0);
+	wait_events(data, n0 + 1, &s);
+	CHECK(s.last.pir_edges == 1);
+	CHECK(!(s.last.flags & PSS_EVF_AUDIO_OFFLINE));
+	if (cam_fail) {
+		CHECK(s.last.kind == PSS_EV_ENTRY);
+		CHECK(s.last.flags & PSS_EVF_NO_IMAGES);
+		CHECK(s.last.n_images == 0);
+		goto done;
+	}
+	check_entry_with_images(data, &s);
+
+	/* (b) Motion first, then the sound 200 ms later. */
+	send_edge(pfd, 1);
+	sleep_ms(200);
+	send_mic_frame(mfd, 0.5, 5.0);
+	sleep_ms(50);
+	send_edge(pfd, 0);
+	wait_events(data, n0 + 2, &s);
+	check_entry_with_images(data, &s);
+
+	/* (c) Motion and sound 1 s apart (> T_co): no ENTRY, no images. The PIR
+	 * stays high in between so both land in one event. */
+	send_edge(pfd, 1);
+	sleep_ms(1000);
+	send_mic_frame(mfd, 0.5, 5.0);
+	sleep_ms(50);
+	send_edge(pfd, 0);
+	wait_events(data, n0 + 3, &s);
+	CHECK(s.last.kind == PSS_EV_MOTION_ONLY);
+	CHECK(s.last.n_images == 0);
+	CHECK(s.opens == 2);	/* only (a) and (b) were confirmed */
+	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, s.last.event_id);
+	CHECK(count_entries(path, ".jpg") == -1);
+done:
+	snprintf(path, sizeof path, "%s/clips", data);
+	CHECK(count_entries(path, ".tmp") == 0);
+	CHECK(stop(cp) == 0);
+	CHECK(stop(hp) == 0);
+	close(pfd);
+	close(mfd);
+	unsetenv("FAKE_RPICAM_FAIL");
+}
+
+static void test_entry_to_storage(void)
+{
+	char root[256], data[300], run[300], fake[512];
+
+	t_mkdtemp(root);
+	snprintf(data, sizeof data, "%s/data", root);
+	snprintf(run, sizeof run, "%s/run", root);
+	snprintf(fake, sizeof fake, "%s/fake-rpicam-still.sh", getenv("PSS_TEST_DIR"));
+	CHECK(chmod(fake, 0755) == 0);
+	setenv("PSS_DATA_DIR", data, 1);
+	setenv("PSS_RUN_DIR", run, 1);
+	setenv("PSS_RPICAM", fake, 1);
+
+	entry_session(data, 0);	/* (a) sound->motion, (b) motion->sound, (c) too far apart */
+	entry_session(data, 1);	/* (d) camera fails: ENTRY kept, flagged no-images */
 	t_rm_rf(root);
 }
 
@@ -341,5 +487,6 @@ int main(void)
 	}
 	T_RUN(test_pir_to_storage);
 	T_RUN(test_sound_to_storage);
+	T_RUN(test_entry_to_storage);
 	T_END();
 }

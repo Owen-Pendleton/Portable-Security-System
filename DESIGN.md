@@ -142,7 +142,7 @@ same device works next to a loud HVAC unit and in a silent room.
 
 **Fusion state machine (in `hub`).**
 ```
-IDLE --PIR rise--> MOTION_WINDOW (±T_co = 3 s around the edge; audio history checked)
+IDLE --PIR rise--> MOTION_WINDOW (±T_co = 5 s around the edge; audio history checked)
 MOTION_WINDOW --impulse or voice in window--> ENTRY (confirmed; durable at once)
 MOTION_WINDOW --window expires, no audio--> MOTION_ONLY
 IDLE --impulse/voice, no PIR within ±T_co--> SOUND_ONLY (hallway)
@@ -199,7 +199,7 @@ segments, with no compaction.
 file → rename → fsync directory. The record referencing a clip is written only
 after the rename is durable, so the log never points at a missing clip. Bursts
 for unconfirmed events are deleted. The `micd` PCM ring holds 15 s, so a full
-10 s pre-roll still exists after the ~3 s confirmation delay.
+10 s pre-roll still exists after the up-to-5 s confirmation delay.
 
 **Recovery (hub start).** For the newest event and stats segments: stop at the
 first bad length or CRC, `ftruncate` there, and log `store: recovered seg=N
