@@ -161,6 +161,21 @@ Events are only reported while ARMED. Macy can also use `pss arm` /
 `pss disarm`. The LED stays dark while armed so the device doesn't draw
 attention.
 
+Rules the diagram leaves open (decided by Bryan, 2026-11-13; code in
+`src/analysis/arm.c`):
+- **Button while ARMED** (no entry yet, e.g. a quiet entry with no sound):
+  disarms. The press is recorded durably like every arm change.
+- **Button during EXIT_DELAY:** cancels back to DISARMED; pressing again
+  starts a fresh 60 s.
+- **Restart or power cut:** every arm change is an fsynced `PSS_REC_ARM`
+  record in the events log, and the hub restores the last one at start.
+  EXIT_DELAY restarts the full delay. GRACE comes back ARMED with the
+  entry *reported*, so pulling the plug during grace can't hide an entry.
+- **While not ARMED or in GRACE** (DISARMED, EXIT_DELAY): no new events are
+  recorded and the camera never fires. An event already open when the
+  device is disarmed finishes normally (so an `owner` entry keeps its
+  images).
+
 **Routine vs. unexpected (optional).** Housekeeping times are often unknown,
 so the expected window is optional (`pss expect 10:00-14:00`). With no window,
 every confirmed entry while armed is reported plainly; with one, entries

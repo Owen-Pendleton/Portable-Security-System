@@ -11,9 +11,14 @@
  * Fusion (DESIGN.md Section 4): motion alone and sound alone are logged but
  * take no images. test_entry_to_storage plays both pird and micd: a PIR rise
  * and a clap within T_co make an ENTRY, the only kind that fires the camera.
+ *
+ * Arm state (DESIGN.md Section 4): a fresh hub starts DISARMED and records
+ * nothing, so every session first arms it with a button press (as pird)
+ * and short --exit-delay-ms. test_arm_decisions checks the arm rules.
  */
 #include "t.h"
 
+#include "analysis/arm.h"
 #include "common/ipc.h"
 #include "common/time.h"
 #include "store/evlog.h"
@@ -34,6 +39,9 @@ struct seen {
 	uint64_t max_boot;
 	struct pss_rec_event last;
 	struct pss_rec_event_open last_open;
+	int arms;		/* ARM records; the first 64 are kept */
+	struct pss_rec_arm arm[64];
+	struct pss_rec_arm last_arm;
 };
 
 static int seen_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *p, uint32_t len, void *arg)
@@ -55,6 +63,11 @@ static int seen_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *p
 		if (b.boot_no > s->max_boot)
 			s->max_boot = b.boot_no;
 		s->boots++;
+	} else if (type == PSS_REC_ARM && len == sizeof s->last_arm) {
+		memcpy(&s->last_arm, p, sizeof s->last_arm);
+		if (s->arms < 64)
+			s->arm[s->arms] = s->last_arm;
+		s->arms++;
 	}
 	return 0;
 }
@@ -120,6 +133,62 @@ static void send_edge(int fd, int rising)
 	CHECK(ipc_send(fd, &m) == 0);
 }
 
+static int connect_as(const char *sock, uint32_t role)
+{
+	struct pss_msg m;
+	int fd = connect_retry(sock);
+
+	CHECK(fd >= 0);
+	pss_msg_init(&m, PSS_MSG_HELLO);
+	m.u.hello.role = role;
+	m.u.hello.pid = (uint32_t)getpid();
+	CHECK(ipc_send(fd, &m) == 0);
+	return fd;
+}
+
+/* fd must be connected as pird: the hub takes button presses only from it. */
+static void press(int fd)
+{
+	struct pss_msg m;
+
+	pss_msg_init(&m, PSS_MSG_BUTTON);
+	m.u.button.presses = 1;
+	CHECK(ipc_send(fd, &m) == 0);
+}
+
+static void scan(const char *data, struct seen *s)
+{
+	memset(s, 0, sizeof *s);
+	CHECK(store_scan(data, PSS_LOG_EVENTS, seen_visitor, s) == 0);
+}
+
+/* Waits (up to 10 s) for at least n ARM records, the last in state st. */
+static void wait_arm(const char *data, int n, uint32_t st, struct seen *s)
+{
+	for (int i = 0; i < 1000; i++) {
+		scan(data, s);
+		if (s->arms >= n && s->last_arm.state == st)
+			return;
+		sleep_ms(10);
+	}
+	fprintf(stderr, "wait_arm: wanted %d records ending %s, have %d ending %s\n", n,
+		arm_state_name(st), s->arms, arm_state_name(s->last_arm.state));
+	CHECK(!"wait_arm timed out");
+}
+
+/* A fresh hub starts DISARMED and records nothing: arm it, as pird would.
+ * A hub restarted on the same data dir may already be ARMED. */
+static void ensure_armed(const char *data, int pir_fd)
+{
+	struct seen s;
+
+	scan(data, &s);
+	if (s.last_arm.state == ARM_ARMED)
+		return;
+	press(pir_fd);
+	wait_arm(data, s.arms + 1, ARM_ARMED, &s);
+}
+
 /* One hub+camd lifetime with one PIR-triggered event. Fills *out from disk. */
 static void run_session(const char *data, struct seen *out)
 {
@@ -135,7 +204,8 @@ static void run_session(const char *data, struct seen *out)
 	if (access(data, F_OK) == 0)
 		CHECK(store_scan(data, PSS_LOG_EVENTS, seen_visitor, &before) == 0);
 
-	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20", NULL });
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
+			       "--exit-delay-ms=200", NULL });
 	CHECK(hp > 0);
 	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
 	fd = connect_retry(sock);
@@ -149,6 +219,7 @@ static void run_session(const char *data, struct seen *out)
 	m.u.hello.pid = (uint32_t)getpid();
 	CHECK(ipc_send(fd, &m) == 0);
 	sleep_ms(1000); /* let camd connect */
+	ensure_armed(data, fd);
 	send_edge(fd, 1);
 	sleep_ms(50);
 	send_edge(fd, 0);
@@ -281,7 +352,7 @@ static void test_sound_to_storage(void)
 	struct seen s = { 0 };
 	uint32_t st = 12345;
 	pid_t hp, cp;
-	int fd, i;
+	int fd, pfd, i;
 
 	t_mkdtemp(root);
 	snprintf(data, sizeof data, "%s/data", root);
@@ -296,7 +367,7 @@ static void test_sound_to_storage(void)
 	snprintf(camd, sizeof camd, "%s/camd", bindir);
 
 	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
-			       "--warmup-frames=250", "--onset-z=6", "--onset-db=10", NULL });
+			       "--warmup-frames=250", "--onset-z=6", "--onset-db=10", "--exit-delay-ms=200", NULL });
 	CHECK(hp > 0);
 	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
 	fd = connect_retry(sock);
@@ -310,6 +381,8 @@ static void test_sound_to_storage(void)
 	m.u.hello.pid = (uint32_t)getpid();
 	CHECK(ipc_send(fd, &m) == 0);
 	sleep_ms(1000); /* let camd connect */
+	pfd = connect_as(sock, PSS_ROLE_PIR);	/* only to press the arm button */
+	ensure_armed(data, pfd);
 
 	/* 10 s of a steady fan, then the fan slowly turned up ~9.5 dB over 30 s. */
 	for (i = 0; i < 500; i++)
@@ -340,21 +413,9 @@ static void test_sound_to_storage(void)
 	CHECK(stop(cp) == 0);
 	CHECK(stop(hp) == 0);
 	close(fd);
+	close(pfd);
 	CHECK(count_events(data, &s) == 1); /* nothing left open at shutdown */
 	t_rm_rf(root);
-}
-
-static int connect_as(const char *sock, uint32_t role)
-{
-	struct pss_msg m;
-	int fd = connect_retry(sock);
-
-	CHECK(fd >= 0);
-	pss_msg_init(&m, PSS_MSG_HELLO);
-	m.u.hello.role = role;
-	m.u.hello.pid = (uint32_t)getpid();
-	CHECK(ipc_send(fd, &m) == 0);
-	return fd;
 }
 
 /* Waits (up to 10 s) until the events log holds n complete events. */
@@ -401,7 +462,7 @@ static void entry_session(const char *data, int cam_fail)
 	n0 = access(data, F_OK) == 0 ? count_events(data, &s) : 0;
 
 	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
-			       "--warmup-frames=50", "--t-co-ms=500", NULL });
+			       "--warmup-frames=50", "--t-co-ms=500", "--exit-delay-ms=200", "--grace-ms=300", NULL });
 	CHECK(hp > 0);
 	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
 	pfd = connect_as(sock, PSS_ROLE_PIR);
@@ -409,6 +470,7 @@ static void entry_session(const char *data, int cam_fail)
 	cp = spawn((char *[]){ camd, NULL });
 	CHECK(cp > 0);
 	sleep_ms(1000);	/* let camd connect */
+	ensure_armed(data, pfd);
 	for (i = 0; i < 100; i++)	/* learn the room background */
 		send_fan(mfd, &st, 0.02);
 
@@ -479,6 +541,169 @@ static void test_entry_to_storage(void)
 	t_rm_rf(root);
 }
 
+static pid_t spawn_arm_hub(const char *hub, const char *exit_arg)
+{
+	pid_t hp = spawn((char *[]){ (char *)hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
+				     "--warmup-frames=50", "--t-co-ms=500", (char *)exit_arg, "--grace-ms=2000",
+				     NULL });
+
+	CHECK(hp > 0);
+	return hp;
+}
+
+/* SIGKILL, like a power cut: no shutdown path runs. */
+static void kill_hard(pid_t pid)
+{
+	int st;
+
+	CHECK(kill(pid, SIGKILL) == 0);
+	CHECK(waitpid(pid, &st, 0) == pid);
+}
+
+/* Door latch, then the person walks into view (an ENTRY if armed). */
+static void door(int pfd, int mfd)
+{
+	send_mic_frame(mfd, 0.5, 5.0);
+	sleep_ms(100);
+	send_edge(pfd, 1);
+	sleep_ms(50);
+	send_edge(pfd, 0);
+}
+
+/*
+ * Bryan's arm decisions (2026-11-13; DESIGN.md Section 4):
+ *  4a/4b: while not armed nothing is recorded and the camera never fires.
+ *  2:     a press during EXIT_DELAY cancels back to DISARMED.
+ *  1:     a press while ARMED (no entry) disarms.
+ *  GRACE: a press labels the entry `owner`; no press, it is `reported`. An
+ *         entry already open when disarmed finishes and keeps its images.
+ *  3:     the state survives a hard kill. Killed in GRACE: back ARMED with
+ *         the entry reported. Killed in EXIT_DELAY: the delay starts over.
+ */
+static void test_arm_decisions(void)
+{
+	char root[256], data[300], run[300], fake[512], path[600], hub[512], camd[512], sock[300];
+	const char *bindir = getenv("PSS_BIN_DIR");
+	struct seen s;
+	uint32_t st = 4242;
+	uint64_t ev;
+	pid_t hp, cp;
+	int pfd, mfd, n, i;
+
+	t_mkdtemp(root);
+	snprintf(data, sizeof data, "%s/data", root);
+	snprintf(run, sizeof run, "%s/run", root);
+	snprintf(fake, sizeof fake, "%s/fake-rpicam-still.sh", getenv("PSS_TEST_DIR"));
+	CHECK(chmod(fake, 0755) == 0);
+	setenv("PSS_DATA_DIR", data, 1);
+	setenv("PSS_RUN_DIR", run, 1);
+	setenv("PSS_RPICAM", fake, 1);
+	unsetenv("FAKE_RPICAM_FAIL");
+	snprintf(hub, sizeof hub, "%s/hub", bindir);
+	snprintf(camd, sizeof camd, "%s/camd", bindir);
+	snprintf(path, sizeof path, "%s/clips", data);
+
+	hp = spawn_arm_hub(hub, "--exit-delay-ms=300");
+	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
+	pfd = connect_as(sock, PSS_ROLE_PIR);
+	mfd = connect_as(sock, PSS_ROLE_MIC);
+	cp = spawn((char *[]){ camd, NULL });
+	CHECK(cp > 0);
+	sleep_ms(1000);	/* let camd connect */
+	for (i = 0; i < 100; i++)	/* learn the room background */
+		send_fan(mfd, &st, 0.02);
+
+	/* 4a/4b: a fresh hub is DISARMED; a full entry leaves no trace. */
+	door(pfd, mfd);
+	sleep_ms(1500);	/* past a 1 s tick and the 300 ms quiet time */
+	scan(data, &s);
+	CHECK(s.arms == 0 && s.events == 0 && s.opens == 0);
+	CHECK(count_entries(path, ".dir") == 0 && count_entries(path, ".tmp") == 0);
+
+	/* 2: press, press again during the exit delay: cancelled. */
+	press(pfd);
+	wait_arm(data, 1, ARM_EXIT_DELAY, &s);
+	press(pfd);
+	wait_arm(data, 2, ARM_DISARMED, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_BUTTON);
+	sleep_ms(1500);	/* the old deadline must not arm it */
+	scan(data, &s);
+	CHECK(s.arms == 2 && s.last_arm.state == ARM_DISARMED);
+
+	/* 1: armed, nobody came in, press: disarmed. */
+	press(pfd);
+	wait_arm(data, 4, ARM_ARMED, &s);
+	CHECK(s.arm[2].state == ARM_EXIT_DELAY && s.last_arm.cause == ARM_CAUSE_EXIT_DELAY_OVER);
+	press(pfd);
+	wait_arm(data, 5, ARM_DISARMED, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_BUTTON && s.last_arm.label == ARM_LABEL_NONE);
+
+	/* GRACE, then a press: the entry is Macy's (owner). It still finishes
+	 * normally, with the images taken while armed. */
+	ensure_armed(data, pfd);
+	door(pfd, mfd);
+	wait_arm(data, 8, ARM_GRACE, &s);
+	ev = s.last_arm.event_id;
+	CHECK(ev != 0 && s.last_arm.cause == ARM_CAUSE_ENTRY);
+	press(pfd);
+	wait_arm(data, 9, ARM_DISARMED, &s);
+	CHECK(s.last_arm.label == ARM_LABEL_OWNER && s.last_arm.event_id == ev);
+	wait_events(data, 1, &s);
+	CHECK(s.last.event_id == ev);
+	check_entry_with_images(data, &s);
+
+	/* GRACE runs out (2 s): reported. */
+	ensure_armed(data, pfd);
+	door(pfd, mfd);
+	wait_arm(data, 12, ARM_GRACE, &s);
+	ev = s.last_arm.event_id;
+	wait_arm(data, 13, ARM_ARMED, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_GRACE_OVER);
+	CHECK(s.last_arm.label == ARM_LABEL_REPORTED && s.last_arm.event_id == ev);
+	wait_events(data, 2, &s);
+	check_entry_with_images(data, &s);
+	CHECK(stop(cp) == 0);	/* no camera for the restarts below */
+
+	/* 3: pull the plug during GRACE. */
+	door(pfd, mfd);
+	wait_arm(data, 14, ARM_GRACE, &s);
+	ev = s.last_arm.event_id;
+	kill_hard(hp);
+	close(pfd);
+	close(mfd);
+	hp = spawn_arm_hub(hub, "--exit-delay-ms=3000");
+	pfd = connect_as(sock, PSS_ROLE_PIR);
+	wait_arm(data, 15, ARM_ARMED, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_RESTORE);
+	CHECK(s.last_arm.label == ARM_LABEL_REPORTED && s.last_arm.event_id == ev);
+	CHECK(s.last.event_id == ev && (s.last.flags & PSS_EVF_INTERRUPTED));	/* recovery closed it */
+
+	/* 3: pull the plug during EXIT_DELAY (3 s here): it starts over. */
+	press(pfd);
+	wait_arm(data, 16, ARM_DISARMED, &s);
+	press(pfd);
+	wait_arm(data, 17, ARM_EXIT_DELAY, &s);
+	kill_hard(hp);
+	close(pfd);
+	hp = spawn_arm_hub(hub, "--exit-delay-ms=3000");
+	wait_arm(data, 18, ARM_EXIT_DELAY, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_RESTORE);
+	n = s.arms;
+	wait_arm(data, n + 1, ARM_ARMED, &s);
+	CHECK(s.last_arm.cause == ARM_CAUSE_EXIT_DELAY_OVER);
+	CHECK(stop(hp) == 0);
+
+	/* A clean restart keeps ARMED without writing anything new. */
+	hp = spawn_arm_hub(hub, "--exit-delay-ms=3000");
+	pfd = connect_as(sock, PSS_ROLE_PIR);	/* connected = the hub finished its restore */
+	sleep_ms(200);
+	scan(data, &s);
+	CHECK(s.arms == n + 1 && s.last_arm.state == ARM_ARMED);
+	CHECK(stop(hp) == 0);
+	close(pfd);
+	t_rm_rf(root);
+}
+
 int main(void)
 {
 	if (getenv("PSS_BIN_DIR") == NULL || getenv("PSS_TEST_DIR") == NULL) {
@@ -488,5 +713,6 @@ int main(void)
 	T_RUN(test_pir_to_storage);
 	T_RUN(test_sound_to_storage);
 	T_RUN(test_entry_to_storage);
+	T_RUN(test_arm_decisions);
 	T_END();
 }

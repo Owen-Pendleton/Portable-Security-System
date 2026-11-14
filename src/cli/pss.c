@@ -3,6 +3,7 @@
  * straight from disk (read-only, through the store's scanner). The hub query
  * socket and timeline/status/health come later.
  */
+#include "analysis/arm.h"
 #include "common/util.h"
 #include "store/clip.h"
 #include "store/evlog.h"
@@ -103,6 +104,16 @@ static int print_visitor(uint32_t seg, uint16_t type, uint16_t ver, const void *
 		fmt_wall(when, sizeof when, b.wall_ns);
 		printf("%s  BOOT    #%" PRIu64 "\n", when, b.boot_no);
 		c->boots++;
+	} else if (type == PSS_REC_ARM && len == sizeof(struct pss_rec_arm)) {
+		struct pss_rec_arm a;
+
+		memcpy(&a, p, sizeof a);
+		fmt_wall(when, sizeof when, a.wall_ns);
+		if (a.label != ARM_LABEL_NONE)
+			printf("%s  %-7s #%-4" PRIu64 " entry %s\n", when, arm_state_name(a.state), a.event_id,
+			       arm_label_name(a.label));
+		else
+			printf("%s  %s\n", when, arm_state_name(a.state));
 	} else if (type == PSS_REC_STATS && len == sizeof(struct pss_rec_stats)) {
 		struct pss_rec_stats s;
 

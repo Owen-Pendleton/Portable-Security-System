@@ -32,6 +32,7 @@ enum pss_rec_type {
 	PSS_REC_EVENT = 2,	/* events log: a complete event, or the close of an EVENT_OPEN */
 	PSS_REC_STATS = 3,	/* stats log only */
 	PSS_REC_EVENT_OPEN = 4,	/* events log: ENTRY confirmed, made durable at once */
+	PSS_REC_ARM = 5,	/* events log: arm state change, made durable at once */
 };
 
 enum pss_event_kind {
@@ -72,6 +73,19 @@ struct pss_rec_event_open {
 	int64_t start_wall_ns;
 	uint32_t kind;
 	uint32_t flags;
+};
+
+/* state, cause and label are the values in analysis/arm.h. A GRACE change
+ * names its entry in event_id; label `owner` or `reported` is that entry's
+ * outcome. The last ARM record is the state restored at hub start. */
+struct pss_rec_arm {
+	int64_t mono_ns;
+	int64_t wall_ns;
+	uint64_t event_id;
+	uint32_t state;		/* the new state */
+	uint32_t cause;
+	uint32_t label;
+	uint32_t pad;
 };
 
 struct pss_rec_stats {
@@ -116,6 +130,8 @@ struct pss_store {
 	int64_t stats_roll_ns;	/* PSS_STATS_ROLL_NS; tests may shorten it */
 	uint64_t next_event_id;	/* above every id in the log and in clips/ */
 	uint64_t boot_no;	/* highest boot_no in the log */
+	uint32_t arm_state;	/* state of the last ARM record, 0 if none */
+	uint64_t arm_event_id;	/* its event_id */
 	struct store_recovery recovered;
 };
 

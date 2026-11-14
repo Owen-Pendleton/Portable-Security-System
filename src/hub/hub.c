@@ -16,9 +16,17 @@
  * AC) never triggers: its flux stays near its own mean and its level is the
  * background. Thresholds are placeholders until tuned on Pi recordings.
  *
+ * Arm state (DESIGN.md Section 4, src/analysis/arm.c): pird's button presses
+ * and confirmed entries drive it, and every change is made durable as a
+ * PSS_REC_ARM record, the last of which is restored at start. New events
+ * open, and the camera fires, only while ARMED or in GRACE; an event already
+ * open when the device is disarmed finishes normally. The LED (not wired
+ * yet, Owen's side) is only logged.
+ *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on error (including any store write
  * failure, so the supervisor restarts us and recovery runs), 2 on usage.
  */
+#include "analysis/arm.h"
 #include "analysis/fusion.h"
 #include "common/ipc.h"
 #include "common/log.h"
@@ -93,6 +101,7 @@ struct hub {
 	struct event ev;
 	struct mic_bg mic;
 	struct fusion fu;
+	struct arm arm;
 	int fatal;		/* a store write failed inside a handler: exit so recovery runs */
 	int64_t start_ns, next_hb_ns;
 	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_onsets;
@@ -111,7 +120,8 @@ static void usage(void)
 {
 	fprintf(stderr, "usage: hub [--quiet-ms=30000] [--burst-frames=20] [--burst-interval-ms=500]\n"
 			"           [--quota-mb=2048] [--floor-pct=5]\n"
-			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250] [--t-co-ms=5000]\n");
+			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250] [--t-co-ms=5000]\n"
+			"           [--exit-delay-ms=60000] [--grace-ms=30000]\n");
 }
 
 static struct conn *conn_for_role(struct hub *h, uint32_t role)
@@ -162,6 +172,38 @@ static void trigger_burst(struct hub *h, int64_t now)
 	h->cam_bursts++;
 }
 
+/* Makes an arm state change durable and logs it (and the LED, until it is
+ * wired). 0, or -1 on a store failure. */
+static int write_arm(struct hub *h, const struct arm_change *c, int64_t now)
+{
+	struct pss_rec_arm r;
+	static const char *const cause[] = { "?", "button", "exit delay over", "entry", "grace over", "restart" };
+	struct arm prev = { .state = c->from };
+
+	memset(&r, 0, sizeof r);
+	r.mono_ns = now;
+	r.wall_ns = pss_wall_ns();
+	r.event_id = c->event_id;
+	r.state = c->to;
+	r.cause = c->cause;
+	r.label = c->label;
+	if (store_append(&h->store, PSS_LOG_EVENTS, PSS_REC_ARM, &r, sizeof r) != 0 ||
+	    store_sync(&h->store, PSS_LOG_EVENTS) != 0) {
+		pss_log("arm: store write failed; exiting so recovery runs");
+		return -1;
+	}
+	if (c->event_id != 0)
+		pss_log("arm: %s -> %s (%s), event %" PRIu64 "%s%s", arm_state_name(c->from), arm_state_name(c->to),
+			cause[c->cause <= ARM_CAUSE_RESTORE ? c->cause : 0], c->event_id,
+			c->label != ARM_LABEL_NONE ? " labelled " : "", arm_label_name(c->label));
+	else
+		pss_log("arm: %s -> %s (%s)", arm_state_name(c->from), arm_state_name(c->to),
+			cause[c->cause <= ARM_CAUSE_RESTORE ? c->cause : 0]);
+	if (arm_led(&prev) != arm_led(&h->arm) || c->cause == ARM_CAUSE_RESTORE)
+		pss_log("arm: LED %s (not wired yet)", arm_led(&h->arm) == ARM_LED_BLINK ? "blink" : "off");
+	return 0;
+}
+
 /* pir: 1 if a PIR rise opened the event, 0 for a sound onset. */
 static void open_event(struct hub *h, int64_t ts, int64_t now, int pir)
 {
@@ -187,9 +229,14 @@ static void confirm_entry(struct hub *h, int64_t dt_ns, int64_t now)
 {
 	struct event *ev = &h->ev;
 	struct pss_rec_event_open o;
+	struct arm_change c;
 
-	if (ev->kind == PSS_EV_ENTRY)
+	if (!ev->open || ev->kind == PSS_EV_ENTRY)
 		return;
+	if (!arm_watching(&h->arm)) {	/* disarmed mid-event: no entry, no camera */
+		pss_log("event %" PRIu64 ": motion+sound, but %s: not an entry", ev->id, arm_state_name(h->arm.state));
+		return;
+	}
 	ev->kind = PSS_EV_ENTRY;
 	memset(&o, 0, sizeof o);
 	o.event_id = ev->id;
@@ -205,6 +252,8 @@ static void confirm_entry(struct hub *h, int64_t dt_ns, int64_t now)
 	pss_log("event %" PRIu64 ": ENTRY confirmed (motion+sound, sound %+.1fs from motion)",
 		ev->id, (double)dt_ns / PSS_NS_PER_S);
 	trigger_burst(h, now);
+	if (arm_entry(&h->arm, ev->id, now, &c) && write_arm(h, &c, now) != 0)
+		h->fatal = 1;
 }
 
 /* Writes the event record and makes it durable. 0, or -1 on a store failure. */
@@ -278,7 +327,8 @@ static void on_pir_edge(struct hub *h, const struct pss_msg *m, int64_t now)
 		int hit = fusion_rise(&h->fu, m->mono_ns, &dt);
 
 		if (!ev->open) {
-			open_event(h, m->mono_ns, now, 1);
+			if (arm_watching(&h->arm))	/* nothing is recorded while not armed */
+				open_event(h, m->mono_ns, now, 1);
 		} else {
 			ev->pir_edges++;
 			ev->pir_high = 1;
@@ -338,10 +388,10 @@ static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 
 		h->mic_onsets++;
 		pss_log("sound onset: flux z=%.1f, +%.1f dB over background", z, db);
-		if (!ev->open)
-			open_event(h, m->mono_ns, now, 0);
-		else
+		if (ev->open)
 			ev->last_activity_ns = now;
+		else if (arm_watching(&h->arm))	/* nothing is recorded while not armed */
+			open_event(h, m->mono_ns, now, 0);
 		if (hit)
 			confirm_entry(h, dt, now);
 		return;
@@ -406,9 +456,18 @@ static void handle_msg(struct hub *h, int idx, const struct pss_msg *m, int64_t 
 	case PSS_MSG_MIC_FRAME:
 		on_mic_frame(h, m, now);
 		break;
-	case PSS_MSG_BUTTON: /* arm state machine not yet implemented */
+	case PSS_MSG_BUTTON: {
+		struct arm_change ch;
+
+		if (c->role != PSS_ROLE_PIR) {	/* the button is wired to pird only */
+			pss_log("%s: button message ignored (not pird)", pss_role_name(c->role));
+			break;
+		}
 		pss_log("arm button press #%" PRIu32, m->u.button.presses);
+		if (arm_button(&h->arm, now, &ch) && write_arm(h, &ch, now) != 0)
+			h->fatal = 1;
 		break;
+	}
 	default:
 		pss_log("%s: unknown message type %u", pss_role_name(c->role), m->type);
 		break;
@@ -506,7 +565,10 @@ static int write_stats(struct hub *h, int64_t now)
 static int tick(struct hub *h, int64_t now)
 {
 	struct event *ev = &h->ev;
+	struct arm_change c;
 
+	if (arm_tick(&h->arm, now, &c) && write_arm(h, &c, now) != 0)
+		return -1;
 	if (ev->open && ev->burst == BURST_PENDING && now > ev->burst_deadline_ns) {
 		pss_log("event %" PRIu64 ": camd result overdue, no images", ev->id);
 		ev->burst = BURST_DONE;
@@ -563,10 +625,13 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		{ "onset-db", required_argument, NULL, 'd' },
 		{ "warmup-frames", required_argument, NULL, 'w' },
 		{ "t-co-ms", required_argument, NULL, 'T' },
+		{ "exit-delay-ms", required_argument, NULL, 'x' },
+		{ "grace-ms", required_argument, NULL, 'g' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	uint32_t quiet_ms = 30000, quota_mb = 2048, t_co_ms = 5000, v;
+	uint32_t exit_delay_ms = 60000, grace_ms = 30000;
 	int opt;
 
 	h->burst_frames = 20;
@@ -588,9 +653,12 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		case 'd': if (v > 120) return -1; h->onset_db = v; break;
 		case 'w': if (v < 1) return -1; h->mic_warmup = v; break;
 		case 'T': if (v < 1 || v > 60000) return -1; t_co_ms = v; break;
+		case 'x': if (v < 1 || v > 3600000) return -1; exit_delay_ms = v; break;
+		case 'g': if (v < 1 || v > 3600000) return -1; grace_ms = v; break;
 		default: return -1;
 		}
 	}
+	arm_init(&h->arm, (int64_t)exit_delay_ms * PSS_NS_PER_MS, (int64_t)grace_ms * PSS_NS_PER_MS);
 	h->quiet_ns = (int64_t)quiet_ms * PSS_NS_PER_MS;
 	h->t_co_ns = (int64_t)t_co_ms * PSS_NS_PER_MS;
 	fusion_init(&h->fu, h->t_co_ns);
@@ -625,6 +693,17 @@ int main(int argc, char **argv)
 	h->store_open = 1;
 	if (write_boot(h) != 0)
 		goto out;
+	{
+		struct arm_change c;
+		int64_t t = pss_mono_ns();
+
+		if (arm_restore(&h->arm, h->store.arm_state, h->store.arm_event_id, t, &c)) {
+			if (write_arm(h, &c, t) != 0)
+				goto out;
+		} else {
+			pss_log("arm: %s (restored)", arm_state_name(h->arm.state));
+		}
+	}
 	if (ipc_sock_path(h->sock_path, sizeof h->sock_path) != 0)
 		goto out;
 	h->listen_fd = ipc_listen(h->sock_path);

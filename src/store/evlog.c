@@ -223,6 +223,12 @@ static int open_visitor(uint32_t seg_no, uint16_t type, uint16_t ver, const void
 		memcpy(&b, payload, sizeof b);
 		if (b.boot_no > s->boot_no)
 			s->boot_no = b.boot_no;
+	} else if (type == PSS_REC_ARM && len == sizeof(struct pss_rec_arm)) {
+		struct pss_rec_arm a;
+
+		memcpy(&a, payload, sizeof a);
+		s->arm_state = a.state;
+		s->arm_event_id = a.event_id;
 	}
 	return 0;
 }
