@@ -1,6 +1,7 @@
 #include "common/client.h"
 
 #include "common/log.h"
+#include "common/suphb.h"
 #include "common/time.h"
 
 #include <errno.h>
@@ -16,6 +17,7 @@ int client_init(struct pss_client *c, uint32_t role)
 	c->fd = -1;
 	c->role = role;
 	c->backoff_ns = BACKOFF_MIN_NS;
+	suphb_init();
 	return ipc_sock_path(c->path, sizeof c->path);
 }
 
@@ -54,6 +56,8 @@ int client_poll_connect(struct pss_client *c, int64_t now_ns)
 
 int client_send(struct pss_client *c, struct pss_msg *m)
 {
+	if (m->type == PSS_MSG_HEARTBEAT)	/* the supervisor hears it even while the hub is down */
+		suphb_beat(m->u.hb.count, m->u.hb.dropped);
 	if (c->fd < 0) {
 		c->dropped++;
 		return -1;

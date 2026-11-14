@@ -112,6 +112,17 @@ Children heartbeat every 5 s. The supervisor restarts any child that exits or
 misses heartbeats for 15 s (SIGKILL first), with backoff 1 s → 60 s that resets
 after 10 min healthy. Exit code `3` means "device gone": the supervisor retries
 every 30 s and the hub marks that sensor DEGRADED instead of storming restarts.
+As built (`src/supervisor`, 2026-11-13): systemd starts the supervisor at boot
+(`deploy/pss.service`, installed once with `deploy/install-service.sh`), so
+Macy only plugs the Pi in and presses the arm button. The children and their
+arguments are listed in `deploy/pss.conf`. Each child gets one end of a
+`socketpair` in `$PSS_SUP_FD`; sensor daemons heartbeat on it through the
+shared `src/common/client.c` (each 5 s heartbeat to the hub is copied there,
+even while the hub is down), and the hub sends its own. A child that never
+heartbeats is killed after 60 s. Children get `PR_SET_PDEATHSIG`, and their
+pids are kept in `/run/pss/supervisor.pids` so a restarted supervisor kills
+any that survived it. The supervisor closes inherited fds at start, so
+children hold only stdin/out/err and their own socket.
 **Why Macy needs it.** A security monitor that silently dies is worse than
 none, because Macy believes it is on duty. If the camera hangs or the mic drops
 off USB, the PIR record must keep flowing and the timeline must say which

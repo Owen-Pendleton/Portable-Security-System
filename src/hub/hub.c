@@ -30,6 +30,7 @@
 #include "analysis/fusion.h"
 #include "common/ipc.h"
 #include "common/log.h"
+#include "common/suphb.h"
 #include "common/time.h"
 #include "common/util.h"
 #include "store/clip.h"
@@ -53,6 +54,7 @@
 #define HB_FIRST_NS (5 * PSS_NS_PER_S)
 #define HB_EVERY_NS (60 * PSS_NS_PER_S)
 #define HB_STALE_NS (15 * PSS_NS_PER_S)
+#define SUPHB_EVERY_NS (5 * PSS_NS_PER_S)	/* to the supervisor, like every daemon */
 #define BURST_SLACK_NS (20 * PSS_NS_PER_S)
 #define BURST_EST_BYTES (9ull * 1024 * 1024)	/* upper end of DESIGN.md Section 5's 6-9 MB */
 #define MIC_ALPHA_MIN (1.0 / 3000)	/* 60 s time constant at 50 frames/s */
@@ -103,7 +105,7 @@ struct hub {
 	struct fusion fu;
 	struct arm arm;
 	int fatal;		/* a store write failed inside a handler: exit so recovery runs */
-	int64_t start_ns, next_hb_ns;
+	int64_t start_ns, next_hb_ns, next_suphb_ns;
 	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_onsets;
 	/* config */
 	int64_t quiet_ns, t_co_ns;
@@ -567,6 +569,10 @@ static int tick(struct hub *h, int64_t now)
 	struct event *ev = &h->ev;
 	struct arm_change c;
 
+	if (now >= h->next_suphb_ns) {
+		suphb_beat(h->events_closed, 0);
+		h->next_suphb_ns = now + SUPHB_EVERY_NS;
+	}
 	if (arm_tick(&h->arm, now, &c) && write_arm(h, &c, now) != 0)
 		return -1;
 	if (ev->open && ev->burst == BURST_PENDING && now > ev->burst_deadline_ns) {
@@ -673,6 +679,7 @@ int main(int argc, char **argv)
 	int code = 1;
 
 	pss_log_init("hub");
+	suphb_init();
 	h->listen_fd = h->epoll_fd = h->sig_fd = h->tick_fd = -1;
 	for (int i = 0; i < MAX_CONNS; i++)
 		h->conns[i].fd = -1;

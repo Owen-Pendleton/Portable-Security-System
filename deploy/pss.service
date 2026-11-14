@@ -1,0 +1,27 @@
+# Portable Security System: starts at boot, no keyboard or screen needed.
+# Installed by deploy/install-service.sh, which fills in @USER@ and @ROOT@.
+#   status:  systemctl status pss
+#   logs:    journalctl -u pss -f
+#   stop:    sudo systemctl stop pss    (do this before deploy/run-m3.sh)
+[Unit]
+Description=Portable Security System (supervisor and sensor daemons)
+After=local-fs.target sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+SupplementaryGroups=gpio audio video
+Environment=PSS_DATA_DIR=/var/lib/pss PSS_RUN_DIR=/run/pss
+# systemd creates both, owned by @USER@.
+StateDirectory=pss
+RuntimeDirectory=pss
+ExecStart=@ROOT@/build/supervisor --config=@ROOT@/deploy/pss.conf
+# The supervisor stops its children on SIGTERM (10 s, then SIGKILL).
+KillMode=mixed
+TimeoutStopSec=20
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

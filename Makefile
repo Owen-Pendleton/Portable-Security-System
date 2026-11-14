@@ -16,11 +16,11 @@ LDFLAGS := $(SAN)
 HAVE_GPIOD := $(shell pkg-config --atleast-version=2.0 libgpiod 2>/dev/null && echo y)
 HAVE_ALSA  := $(shell pkg-config --exists alsa 2>/dev/null && echo y)
 
-COMMON := common/log common/time common/util common/ipc common/client
+COMMON := common/log common/time common/util common/ipc common/client common/suphb
 STORE  := store/crc32 store/dirlist store/evlog store/clip
 obj = $(addprefix $(BUILD)/obj/,$(addsuffix .o,$(1)))
 
-BINS := $(BUILD)/hub $(BUILD)/camd $(BUILD)/pss
+BINS := $(BUILD)/hub $(BUILD)/camd $(BUILD)/pss $(BUILD)/supervisor
 ifeq ($(HAVE_GPIOD),y)
 BINS += $(BUILD)/pird
 endif
@@ -28,7 +28,7 @@ ifeq ($(HAVE_ALSA),y)
 BINS += $(BUILD)/micd
 endif
 
-TESTS     := test_store test_ipc test_pir_logic test_button_logic test_features test_fusion test_arm test_e2e
+TESTS     := test_store test_ipc test_pir_logic test_button_logic test_features test_fusion test_arm test_sup_policy test_e2e test_supervisor
 TEST_BINS := $(addprefix $(BUILD)/tests/,$(TESTS))
 TEST_ENV  := PSS_BIN_DIR=$(abspath $(BUILD)) PSS_TEST_DIR=$(CURDIR)/tests
 
@@ -62,6 +62,9 @@ $(BUILD)/camd: $(call obj,capture/cam/camd $(COMMON) store/dirlist store/clip)
 $(BUILD)/pss: $(call obj,cli/pss analysis/arm $(COMMON) $(STORE))
 	$(CC) $(LDFLAGS) $^ -o $@
 
+$(BUILD)/supervisor: $(call obj,supervisor/supervisor supervisor/policy $(COMMON))
+	$(CC) $(LDFLAGS) $^ -o $@
+
 $(BUILD)/pird: $(call obj,capture/pir/pird capture/pir/pir_logic capture/pir/button_logic $(COMMON))
 	$(CC) $(LDFLAGS) $^ -o $@ $(shell pkg-config --libs libgpiod)
 
@@ -76,11 +79,16 @@ $(BUILD)/tests/test_features: $(call obj,tests/test_features capture/mic/feature
 $(BUILD)/tests/test_fusion: $(call obj,tests/test_fusion analysis/fusion $(COMMON))
 $(BUILD)/tests/test_arm: $(call obj,tests/test_arm analysis/arm $(COMMON))
 $(BUILD)/tests/test_e2e: $(call obj,tests/test_e2e analysis/arm $(COMMON) $(STORE))
-$(TEST_BINS):
+$(BUILD)/tests/test_sup_policy: $(call obj,tests/test_sup_policy supervisor/policy $(COMMON))
+$(BUILD)/tests/test_supervisor: $(call obj,tests/test_supervisor $(COMMON))
+$(BUILD)/tests/fake_child: $(call obj,tests/fake_child $(COMMON))
+$(TEST_BINS) $(BUILD)/tests/fake_child:
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ -o $@ -lm
 
-test: $(TEST_BINS) $(BUILD)/hub $(BUILD)/camd $(BUILD)/pss
+TEST_PROGS := $(BUILD)/hub $(BUILD)/camd $(BUILD)/pss $(BUILD)/supervisor $(BUILD)/tests/fake_child
+
+test: $(TEST_BINS) $(TEST_PROGS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t"; $(TEST_ENV) $$t; done
 	@echo "== all tests passed ($(BUILD))"
 
@@ -89,7 +97,7 @@ ASAN_CC := $(shell command -v clang >/dev/null 2>&1 && echo clang || echo $(CC))
 asan:
 	$(MAKE) CC=$(ASAN_CC) BUILD=build-asan SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" test
 
-memcheck: $(TEST_BINS) $(BUILD)/hub $(BUILD)/camd
+memcheck: $(TEST_BINS) $(TEST_PROGS)
 	@set -e; for t in $(TEST_BINS); do echo "== valgrind $$t"; \
 		$(TEST_ENV) valgrind -q --error-exitcode=1 --leak-check=full \
 		--errors-for-leak-kinds=definite,indirect $$t; done
