@@ -74,9 +74,49 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
      the camera.
   3. Clap and motion together: ENTRY, images taken and saved.
 
+## Arm button in pird (Owen, branch `m4-arm-button`)
+- `pird` requests GPIO27 together with the PIR line (pull-up, both
+  edges, kernel timestamps). A fall counts as a press only if the line
+  was high for at least the debounce period before it
+  (`src/capture/pir/button_logic.c`, tested by `tests/test_button_logic.c`).
+  It is debounced by the kernel and in software in IRQ mode, and in
+  software only with `--poll`. The PIR warm-up does not apply to it. Each
+  press goes to the hub as `PSS_MSG_BUTTON`. The hub only logs it
+  (`arm button press #N`, approved by Bryan); the arm state machine is
+  still to come.
+- **Lab machine:** `make`, `make test`, `make asan`, `make memcheck`,
+  `make netcheck` pass. pird doesn't build there (no libgpiod v2).
+- **Raw bounce on the Pi** (debounce off, `--button-debounce-ms=0`):
+  - 10 presses gave 12 counted. The 2 extras were release bounces,
+    12 µs and 38 µs after a release. Each bouncing release settled
+    within 0.64 ms.
+  - Presses never bounced.
+  - `gpiomon`, 11 presses: one release bounced, for about 0.23 ms.
+  - With debounce off the kernel once reported two falls in a row
+    10 µs apart: edge direction is unreliable during a fast bounce. So
+    the kernel debounce is kept on in IRQ mode, not only the software
+    filter.
+- **Chosen debounce: 20 ms** (the default). That is about 30x the
+  longest bounce, and far below the gap between real presses (at least
+  1 s here).
+- **20-press checks** (`deploy/run-m3.sh`, PIR wired, no mic):
+
+  | Mode | pird `press #` | hub `arm button press` | bounces | dropped |
+  |---|---|---|---|---|
+  | IRQ, kernel+software 20 ms | 20 | 20 | 0 | 0 |
+  | `--poll=10`, software 20 ms | 20 | 20 | 0 | 0 |
+
+  - Presses #1-13 of the IRQ run came during the PIR's 60 s warm-up and
+    were all forwarded: no warm-up on the button.
+  - IRQ latency was 7-33 µs.
+  - With kernel debounce on, button timestamps fall on about a 4 ms grid.
+    The kernel stamps the event when its debounce timer fires, so for
+    the button `lat=` is measured from the end of the debounce, not from
+    the contact. Press-to-hub delay is about 20-24 ms. Mechanism B
+    latency numbers should therefore come from the PIR line, or from
+    the button with debounce off.
+
 ## Open items
-- Arm button code: nothing reads GPIO27 yet (pird, Owen's area). The
-  button is wired and verified with `gpiomon`.
 - Arm state machine (DISARMED/EXIT_DELAY/ARMED/GRACE) in the hub; LED
   hardware.
 - Impulse and voice detectors (DESIGN.md Section 4) still to replace the
