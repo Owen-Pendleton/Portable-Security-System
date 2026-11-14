@@ -174,5 +174,11 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
   M3 sound onset as fusion's audio input.
 - Capture a full Pi log of the three fusion cases for the record.
 - RTC cell type, to decide on charging.
-- Known from M3: bursts give 18 of 20 frames; rpicam-still prints a
-  screenful of libcamera INFO per frame (camd).
+- Known from M3: bursts give 18 of 20 frames (camd). Deferred: the
+  pictures still cover about 9 s of an entry.
+- Done (Owen, 2026-11-13): camd no longer prints a screenful of
+  libcamera INFO per frame. rpicam-still gets `--verbose=0`, and camd
+  sets `LIBCAMERA_LOG_LEVELS=*:WARN` unless it is already set
+  (`LIBCAMERA_LOG_LEVELS=*:INFO` brings the detail back). Checked on the
+  Pi: after arming, a triggered ENTRY burst printed no INFO text, and its
+  images were taken and committed.
