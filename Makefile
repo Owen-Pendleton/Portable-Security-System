@@ -28,7 +28,7 @@ ifeq ($(HAVE_ALSA),y)
 BINS += $(BUILD)/micd
 endif
 
-TESTS     := test_store test_ipc test_pir_logic test_features test_fusion test_e2e
+TESTS     := test_store test_ipc test_pir_logic test_button_logic test_features test_fusion test_e2e
 TEST_BINS := $(addprefix $(BUILD)/tests/,$(TESTS))
 TEST_ENV  := PSS_BIN_DIR=$(abspath $(BUILD)) PSS_TEST_DIR=$(CURDIR)/tests
 
@@ -62,7 +62,7 @@ $(BUILD)/camd: $(call obj,capture/cam/camd $(COMMON) store/dirlist store/clip)
 $(BUILD)/pss: $(call obj,cli/pss $(COMMON) $(STORE))
 	$(CC) $(LDFLAGS) $^ -o $@
 
-$(BUILD)/pird: $(call obj,capture/pir/pird capture/pir/pir_logic $(COMMON))
+$(BUILD)/pird: $(call obj,capture/pir/pird capture/pir/pir_logic capture/pir/button_logic $(COMMON))
 	$(CC) $(LDFLAGS) $^ -o $@ $(shell pkg-config --libs libgpiod)
 
 $(BUILD)/micd: $(call obj,capture/mic/micd capture/mic/features $(COMMON))
@@ -71,6 +71,7 @@ $(BUILD)/micd: $(call obj,capture/mic/micd capture/mic/features $(COMMON))
 $(BUILD)/tests/test_store: $(call obj,tests/test_store $(COMMON) $(STORE))
 $(BUILD)/tests/test_ipc: $(call obj,tests/test_ipc $(COMMON))
 $(BUILD)/tests/test_pir_logic: $(call obj,tests/test_pir_logic capture/pir/pir_logic $(COMMON))
+$(BUILD)/tests/test_button_logic: $(call obj,tests/test_button_logic capture/pir/button_logic $(COMMON))
 $(BUILD)/tests/test_features: $(call obj,tests/test_features capture/mic/features $(COMMON))
 $(BUILD)/tests/test_fusion: $(call obj,tests/test_fusion analysis/fusion $(COMMON))
 $(BUILD)/tests/test_e2e: $(call obj,tests/test_e2e $(COMMON) $(STORE))

@@ -28,6 +28,7 @@ enum pss_msg_type {
 	PSS_MSG_CAM_TRIGGER,	/* hub -> camd */
 	PSS_MSG_CAM_DONE,	/* camd -> hub */
 	PSS_MSG_MIC_FRAME,	/* micd -> hub, 50 Hz */
+	PSS_MSG_BUTTON,		/* pird -> hub, one per debounced arm-button press */
 };
 
 struct pss_msg {
@@ -39,6 +40,8 @@ struct pss_msg {
 		struct { uint32_t role; uint32_t pid; } hello;
 		struct { uint64_t dropped; uint64_t count; } hb;
 		struct { uint32_t rising; uint32_t pad; } pir;
+		/* presses: pird's running count, so the hub can spot a lost press */
+		struct { uint32_t presses; uint32_t pad; } button;
 		struct { uint64_t event_id; uint32_t frames; uint32_t interval_ms; } cam_trigger;
 		/* status: 0 ok, >0 rpicam exit code (128+sig if killed), <0 -errno in camd */
 		struct { uint64_t event_id; int32_t status; uint32_t frames; } cam_done;

@@ -406,6 +406,9 @@ static void handle_msg(struct hub *h, int idx, const struct pss_msg *m, int64_t 
 	case PSS_MSG_MIC_FRAME:
 		on_mic_frame(h, m, now);
 		break;
+	case PSS_MSG_BUTTON: /* arm state machine not yet implemented */
+		pss_log("arm button press #%" PRIu32, m->u.button.presses);
+		break;
 	default:
 		pss_log("%s: unknown message type %u", pss_role_name(c->role), m->type);
 		break;
