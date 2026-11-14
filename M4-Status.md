@@ -116,9 +116,60 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
     latency numbers should therefore come from the PIR line, or from
     the button with debounce off.
 
+## Arm state machine in the hub (Bryan, commit 32478e1)
+- **Rule** (`src/analysis/arm.c`, called from the hub; DESIGN.md
+  Section 4): DISARMED --button--> EXIT_DELAY (60 s) --> ARMED
+  --ENTRY--> GRACE (30 s). A press in GRACE disarms and labels the entry
+  `owner`. If GRACE runs out, the entry is labelled `reported`.
+  `--exit-delay-ms` and `--grace-ms` override the times.
+- **Decisions DESIGN.md left open** (Bryan, now in DESIGN.md Section 4):
+  1. A press while ARMED (no entry yet, e.g. a quiet entry with no
+     sound) disarms.
+  2. A press during EXIT_DELAY cancels back to DISARMED, so a double
+     press cancels arming.
+  3. The state survives a restart or power cut. A restart during
+     EXIT_DELAY starts the full delay over. A restart during GRACE comes
+     back ARMED with the entry `reported`, so pulling the plug can't hide
+     an entry.
+  4. While DISARMED or in EXIT_DELAY, no new events are recorded and the
+     camera never fires. An event already open when the device is
+     disarmed finishes normally, so an `owner` entry keeps its images.
+- **Storage:** every arm change is a new `PSS_REC_ARM` record in the
+  events log, fsynced at once. The hub restores the last one at start.
+  `pss events` prints these records, with the owner/reported label.
+- **Hub:** button presses are accepted from pird only. The LED state is
+  logged (`arm: LED blink/off (not wired yet)`) until it is wired.
+- **Lab machine:** `make`, `make test`, `make asan`, `make memcheck` and
+  `make netcheck` pass.
+  - The new `test_arm` covers every transition and both timeouts at
+    their exact boundaries.
+  - The existing e2e tests now arm the hub first, since a fresh hub
+    records nothing. Their checks are unchanged.
+  - The new `test_arm_decisions` runs a real hub. It covers each decision
+    above, including SIGKILL during GRACE and during EXIT_DELAY. Hub log
+    from that run:
+    ```
+    hub: arm: EXIT_DELAY -> DISARMED (button)
+    hub: arm: ARMED -> DISARMED (button)
+    hub: arm: GRACE -> DISARMED (button), event 1 labelled owner
+    hub: arm: GRACE -> ARMED (grace over), event 2 labelled reported
+    hub: store: event 3 was open when power was lost; closed as interrupted (0 images kept)
+    hub: arm: GRACE -> ARMED (restart), event 3 labelled reported
+    hub: arm: EXIT_DELAY -> EXIT_DELAY (restart)
+    ```
+- **Not yet checked on the Pi** with the real button.
+- **Side effect of decision 4:** while disarmed no event is open, so the
+  mic background model keeps learning, including people talking. It
+  adjusts back within about a minute (its time constant), and the 60 s
+  exit delay mostly covers that.
+
 ## Open items
-- Arm state machine (DISARMED/EXIT_DELAY/ARMED/GRACE) in the hub; LED
-  hardware.
+- Arm state machine on the Pi: press, wait out the 60 s, walk in, press
+  within 30 s; check the `arm:` lines in the hub log and in `pss events`.
+- LED hardware, plus a hub -> pird message to drive it (Owen to decide
+  who times the blink).
+- `pss arm` / `pss disarm`: needs a new message or role in the shared
+  `src/common/ipc.h` (agree with Owen first).
 - Impulse and voice detectors (DESIGN.md Section 4) still to replace the
   M3 sound onset as fusion's audio input.
 - Capture a full Pi log of the three fusion cases for the record.
