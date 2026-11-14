@@ -69,7 +69,7 @@ static pid_t spawn_rpicam(const struct camd *c, const char *outpat, uint32_t fra
 {
 	char t_ms[16], tl_ms[16], w[16], h[16];
 	char *argv[] = {
-		(char *)c->rpicam, "-n", "-t", t_ms, "--timelapse", tl_ms,
+		(char *)c->rpicam, "-n", "--verbose=0", "-t", t_ms, "--timelapse", tl_ms,
 		"--width", w, "--height", h, "-q", "85", "-o", (char *)outpat, NULL,
 	};
 	pid_t pid;
@@ -275,6 +275,11 @@ int main(int argc, char **argv)
 		default: usage(); return opt == 'h' ? 0 : EXIT_USAGE;
 		}
 	}
+	/* libcamera prints a screenful of INFO per frame; keep warnings and
+	 * errors only (inherited by rpicam-still). An existing setting wins, so
+	 * LIBCAMERA_LOG_LEVELS=*:INFO brings the detail back for debugging. */
+	if (setenv("LIBCAMERA_LOG_LEVELS", "*:WARN", 0) != 0)
+		pss_log("setenv LIBCAMERA_LOG_LEVELS: %s", strerror(errno));
 	c.rpicam = getenv("PSS_RPICAM");
 	if (c.rpicam == NULL || c.rpicam[0] == '\0')
 		c.rpicam = "rpicam-still";
