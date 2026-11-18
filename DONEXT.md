@@ -55,70 +55,35 @@ false event. They are probably glitches from noise on the loose jumper
 wires. If it keeps happening, capture `gpiomon GPIO17` with the service
 stopped before proposing any fix.
 
-## NEXT: repeat bursts during a long ENTRY (plan only, NOT approved yet)
-**Request (Owen and Bryan):** fire a burst at the ENTRY, then every
-minute while the event stays open, and stop taking pictures 5 minutes
-after the first burst. The cap exists so that long events (e.g. 20 min)
-can't use up storage.
+## DONE: repeat bursts during a long ENTRY (2026-11-18, commit c567880)
+Built from the plan that was here, with the three decisions settled:
+stop after a disarm in GRACE (first burst kept); cap at 5 bursts (0-4
+min); Bryan OK'd Owen's session doing it.
 
-**Why this isn't just a timer:** a burst is written to
-`clips/<id>.dir.tmp` and committed by renaming that folder to
-`clips/<id>.dir` (`clip_commit`, `src/store/clip.c`). A second burst for
-the same event would rename onto a folder that already exists and has
-files, which fails. Its files would also clash by name, since every
-burst writes `img0000.jpg` onward.
+- **Store** (`clip_append()`, `src/store/clip.c`): later bursts go into
+  the existing `clips/<id>.dir` as `b<n>-img*.jpg`; the first keeps its
+  plain names. A crash midway leaves a partial burst; earlier bursts are
+  untouched.
+- **Hub:** repeat burst while the ENTRY is open and the device is ARMED or
+  GRACE. Options `--reburst-ms=60000`, `--reburst-cap-ms=300000` (0 = one
+  burst). `no-images` is set at close only if the event's total is 0.
+- **Changed from the plan:** each burst is due at a fixed offset from the
+  first (first + n x 60 s), not "60 s after the last one", so the count
+  is always 5 whatever the 1 s tick phase. On the Pi a burst may be up to
+  1 s late.
+- **Changed from the plan:** the e2e test uses 1 s bursts and a 3.5 s cap
+  (4 bursts), not 200 ms / 1 s, because the hub ticks once a second.
+- **Tests:** `test_store.c` (append, interrupted append), `test_e2e.c`
+  `test_repeat_bursts` (cap, GRACE disarm, short event). make, make test,
+  make asan, make netcheck all pass.
+- **Known edge case (not handled):** if camd hangs past the burst timeout
+  and reports late while the next burst is running, that report is taken
+  as the new burst's result. Only possible if camd stalls for over ~30 s.
 
-### Plan
-1. **`src/store/clip.{c,h}` (Bryan's area):** new `clip_append()`.
-   - If `clips/<id>.dir` doesn't exist yet, do what `clip_commit` does
-     today.
-   - Otherwise, fsync each new file, rename it into the existing folder
-     with a burst prefix (`b2-img0000.jpg`, ...), fsync the folder, remove
-     the empty `.tmp` folder and fsync `clips/`.
-   - A crash midway gives at most a partial burst. Startup already deletes
-     leftover `.tmp` folders. There are never torn files, and earlier
-     bursts are untouched.
-   - Tests in `tests/test_store.c`: append without name clashes and with
-     the right total, and recovery from an interrupted append.
-2. **`src/hub/hub.c` (shared):** add `first_burst_ns` and `bursts` to
-   `struct event`.
-   - In the tick, call `trigger_burst()` again when all of these hold:
-     the event is open and is an ENTRY, no burst is in progress, at least
-     60 s have passed since the last burst, less than 5 min has passed
-     since the first burst, and the device is watching (ARMED or GRACE).
-   - `on_cam_done` uses `clip_append` and keeps a running image total.
-   - Set `PSS_EVF_NO_IMAGES` at close only if the total is 0. A failed
-     later burst is logged and counted, but doesn't mark the event
-     no-images.
-   - Each burst still runs the quota check first.
-   - New options: `--reburst-ms=60000` and `--reburst-cap-ms=300000`.
-     A cap of 0 gives today's one-burst behaviour.
-3. **`tests/test_e2e.c`:** fake camera with short times (200 ms apart,
-   1 s cap). Check:
-   - the expected burst count and summed image count
-   - it stops at the cap
-   - it stops after the owner disarms in GRACE
-   - a short event still gets one burst
-4. **Not changed:** camd, `src/common/ipc.h`, `pss events`, anything in
-   `src/capture`.
-
-**Storage:** DESIGN.md Section 5 estimates 6-9 MB per burst, so at most
-about 45 MB per 5-burst event. The 2 GB clips quota already deletes the
-oldest clips first, so the disk can't fill; at worst old pictures go
-sooner. About 45 long events fit before anything is deleted.
-
-### Decisions needed before coding
-1. **After the owner disarms during GRACE:** stop the repeat bursts?
-   (Proposed: yes; the first burst is kept.)
-2. **Cap:** 5 bursts (at 0, 1, 2, 3, 4 min; proposed), or a 6th at 5:00?
-3. **Who builds it:** most of this is Bryan's code (store) plus the
-   shared hub. Either Bryan OKs Owen's session making the change, or
-   Bryan's session builds it from this plan.
-
-Then follow CLAUDE.md: plan approved first, done = make, make test,
-make asan, make netcheck pass (shown), then verify on the Pi with a long
-event (stay in view more than 5 min) and check
-`ls --full-time /var/lib/pss/clips/<id>.dir`.
+**Still to do: verify on the Pi.** Pull, rebuild, stay in view for more
+than 5 min, then check `ls --full-time /var/lib/pss/clips/<id>.dir`.
+Expect 5 bursts about a minute apart (`img*`, `b2-` to `b5-`) and
+`pss events` showing the summed image count.
 
 ## Other open items (from M4-Status.md)
 - **LED** (GPIO22, pin 15, not bought). Proposed: the hub sends an LED
