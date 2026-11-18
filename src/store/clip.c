@@ -150,6 +150,83 @@ out:
 	return ret;
 }
 
+int clip_append(int clips_dir_fd, uint64_t event_id, uint32_t burst_no, uint32_t *n_images)
+{
+	char tmp[48], final[48], dst[288];
+	struct dirlist dl;
+	uint32_t n = 0;
+	int tmp_fd = -1, fin_fd, ret = -1;
+
+	if (clip_tmp_name(tmp, sizeof tmp, event_id) != 0 || clip_final_name(final, sizeof final, event_id) != 0)
+		return -1;
+	fin_fd = openat(clips_dir_fd, final, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fin_fd < 0) {
+		if (errno == ENOENT)	/* first burst that got images */
+			return clip_commit(clips_dir_fd, event_id, n_images);
+		pss_log("clip: open %s: %s", final, strerror(errno));
+		return -1;
+	}
+	tmp_fd = openat(clips_dir_fd, tmp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (tmp_fd < 0) {
+		pss_log("clip: open %s: %s", tmp, strerror(errno));
+		goto out;
+	}
+	if (dirlist_read(tmp_fd, &dl) != 0)
+		goto out;
+	for (size_t i = 0; i < dl.n; i++) {
+		int fd = openat(tmp_fd, dl.names[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+		int r;
+
+		if (fd < 0) {
+			pss_log("clip: open %s/%s: %s", tmp, dl.names[i], strerror(errno));
+			dirlist_free(&dl);
+			goto out;
+		}
+		if (fsync(fd) != 0) {
+			pss_log("clip: fsync %s/%s: %s", tmp, dl.names[i], strerror(errno));
+			close(fd);
+			dirlist_free(&dl);
+			goto out;
+		}
+		if (close(fd) != 0)
+			pss_log("clip: close %s/%s: %s", tmp, dl.names[i], strerror(errno));
+		r = snprintf(dst, sizeof dst, "b%" PRIu32 "-%s", burst_no, dl.names[i]);
+		if (r < 0 || (size_t)r >= sizeof dst) {
+			pss_log("clip: name too long: %s/%s", tmp, dl.names[i]);
+			dirlist_free(&dl);
+			goto out;
+		}
+		if (renameat(tmp_fd, dl.names[i], fin_fd, dst) != 0) {
+			pss_log("clip: rename %s/%s -> %s/%s: %s", tmp, dl.names[i], final, dst, strerror(errno));
+			dirlist_free(&dl);
+			goto out;
+		}
+		if (has_suffix(dl.names[i], ".jpg"))
+			n++;
+	}
+	dirlist_free(&dl);
+	if (fsync(fin_fd) != 0) {
+		pss_log("clip: fsync %s: %s", final, strerror(errno));
+		goto out;
+	}
+	if (unlinkat(clips_dir_fd, tmp, AT_REMOVEDIR) != 0) {
+		pss_log("clip: rmdir %s: %s", tmp, strerror(errno));
+		goto out;
+	}
+	if (fsync(clips_dir_fd) != 0) {
+		pss_log("clip: fsync clips/: %s", strerror(errno));
+		goto out;
+	}
+	*n_images = n;
+	ret = 0;
+out:
+	if (tmp_fd >= 0 && close(tmp_fd) != 0)
+		pss_log("clip: close %s: %s", tmp, strerror(errno));
+	if (close(fin_fd) != 0)
+		pss_log("clip: close %s: %s", final, strerror(errno));
+	return ret;
+}
+
 int clip_discard(int clips_dir_fd, uint64_t event_id)
 {
 	char tmp[48];

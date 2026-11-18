@@ -7,7 +7,10 @@
  * MOTION_ONLY event and a sound onset (below) opens a SOUND_ONLY event, but
  * neither takes images. Only when a rise and an onset fall within +-T_co of
  * each other (either order) does the event become an ENTRY: it is made
- * durable at once and camd is asked for a burst, once per event.
+ * durable at once and camd is asked for a burst. While the ENTRY stays open
+ * and the device is watching, a burst repeats every --reburst-ms after the
+ * first, until --reburst-cap-ms after it (default: at 0-4 min, 5 bursts).
+ * Repeat bursts are appended to the same clips/<id>.dir (clip_append).
  *
  * M3 sound trigger (stand-in for DESIGN.md Section 4's detectors, M4): an
  * EWMA background model of spectral flux and log RMS, learned only while no
@@ -85,6 +88,8 @@ struct event {
 	uint32_t n_images;
 	enum burst_state burst;
 	int64_t burst_deadline_ns;
+	uint32_t bursts;	/* asked for, including failed ones */
+	int64_t first_burst_ns;
 };
 
 /* EWMA mean/variance of flux and log10(rms), learned outside events. */
@@ -108,7 +113,7 @@ struct hub {
 	int64_t start_ns, next_hb_ns, next_suphb_ns;
 	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_onsets;
 	/* config */
-	int64_t quiet_ns, t_co_ns;
+	int64_t quiet_ns, t_co_ns, reburst_ns, reburst_cap_ns;
 	uint32_t burst_frames, burst_interval_ms, floor_pct;
 	uint64_t quota_bytes;
 	double onset_z, onset_db;
@@ -123,7 +128,8 @@ static void usage(void)
 	fprintf(stderr, "usage: hub [--quiet-ms=30000] [--burst-frames=20] [--burst-interval-ms=500]\n"
 			"           [--quota-mb=2048] [--floor-pct=5]\n"
 			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250] [--t-co-ms=5000]\n"
-			"           [--exit-delay-ms=60000] [--grace-ms=30000]\n");
+			"           [--exit-delay-ms=60000] [--grace-ms=30000]\n"
+			"           [--reburst-ms=60000] [--reburst-cap-ms=300000]\n");
 }
 
 static struct conn *conn_for_role(struct hub *h, uint32_t role)
@@ -149,15 +155,16 @@ static void trigger_burst(struct hub *h, int64_t now)
 	uint32_t evicted = 0;
 	int q;
 
+	if (ev->bursts++ == 0)
+		ev->first_burst_ns = now;
 	if (cam == NULL) {
-		pss_log("event %" PRIu64 ": camd not connected, no images", ev->id);
-		ev->flags |= PSS_EVF_NO_IMAGES;
+		pss_log("event %" PRIu64 ": camd not connected, no images (burst %" PRIu32 ")", ev->id, ev->bursts);
 		return;
 	}
 	q = clip_enforce_quota(h->store.clips_dir_fd, h->quota_bytes, BURST_EST_BYTES, h->floor_pct, &evicted);
 	if (q != 0) {
-		pss_log("event %" PRIu64 ": %s, no images", ev->id, q > 0 ? "clips disabled" : "quota check failed");
-		ev->flags |= PSS_EVF_NO_IMAGES;
+		pss_log("event %" PRIu64 ": %s, no images (burst %" PRIu32 ")", ev->id,
+			q > 0 ? "clips disabled" : "quota check failed", ev->bursts);
 		return;
 	}
 	pss_msg_init(&m, PSS_MSG_CAM_TRIGGER);
@@ -165,8 +172,7 @@ static void trigger_burst(struct hub *h, int64_t now)
 	m.u.cam_trigger.frames = h->burst_frames;
 	m.u.cam_trigger.interval_ms = h->burst_interval_ms;
 	if (ipc_send(cam->fd, &m) != 0) {
-		pss_log("event %" PRIu64 ": trigger to camd failed: %s", ev->id, strerror(errno));
-		ev->flags |= PSS_EVF_NO_IMAGES;
+		pss_log("event %" PRIu64 ": trigger to camd failed: %s (burst %" PRIu32 ")", ev->id, strerror(errno), ev->bursts);
 		return;
 	}
 	ev->burst = BURST_PENDING;
@@ -274,6 +280,8 @@ static int close_event(struct hub *h, int64_t end_ns, uint32_t extra_flags)
 	else
 		r.kind = ev->pir_edges > 0 ? PSS_EV_MOTION_ONLY : PSS_EV_SOUND_ONLY;
 	r.flags = ev->flags | extra_flags;
+	if (ev->bursts > 0 && ev->n_images == 0)	/* a later burst failing doesn't count */
+		r.flags |= PSS_EVF_NO_IMAGES;
 	r.pir_edges = ev->pir_edges;
 	r.n_images = ev->n_images;
 	if (store_event_close(&h->store, &r) != 0) {
@@ -303,20 +311,19 @@ static void on_cam_done(struct hub *h, const struct pss_msg *m)
 	ev->burst = BURST_DONE;
 	if (m->u.cam_done.status != 0 || m->u.cam_done.frames == 0) {
 		h->cam_failures++;
-		ev->flags |= PSS_EVF_NO_IMAGES;
-		pss_log("event %" PRIu64 ": burst failed (status %" PRId32 ", %" PRIu32 " frames)",
-			id, m->u.cam_done.status, m->u.cam_done.frames);
+		pss_log("event %" PRIu64 ": burst %" PRIu32 " failed (status %" PRId32 ", %" PRIu32 " frames)",
+			id, ev->bursts, m->u.cam_done.status, m->u.cam_done.frames);
 		clip_discard(h->store.clips_dir_fd, id);
 		return;
 	}
-	if (clip_commit(h->store.clips_dir_fd, id, &n) != 0) {
+	if (clip_append(h->store.clips_dir_fd, id, ev->bursts, &n) != 0) {
 		h->cam_failures++;
-		ev->flags |= PSS_EVF_NO_IMAGES;
 		clip_discard(h->store.clips_dir_fd, id);
 		return;
 	}
-	ev->n_images = n;
-	pss_log("event %" PRIu64 ": committed %" PRIu32 " images to clips/%" PRIu64 ".dir", id, n, id);
+	ev->n_images += n;
+	pss_log("event %" PRIu64 ": burst %" PRIu32 " committed %" PRIu32 " images to clips/%" PRIu64 ".dir (%" PRIu32 " total)",
+		id, ev->bursts, n, id, ev->n_images);
 }
 
 static void on_pir_edge(struct hub *h, const struct pss_msg *m, int64_t now)
@@ -413,7 +420,6 @@ static void conn_drop(struct hub *h, int idx, const char *why)
 	pss_log("%s disconnected (%s)", pss_role_name(c->role), why);
 	if (c->role == PSS_ROLE_CAM && h->ev.open && h->ev.burst == BURST_PENDING) {
 		h->ev.burst = BURST_DONE;
-		h->ev.flags |= PSS_EVF_NO_IMAGES;
 		h->cam_failures++;
 	}
 	if (c->role == PSS_ROLE_PIR) {
@@ -578,12 +584,20 @@ static int tick(struct hub *h, int64_t now)
 	if (ev->open && ev->burst == BURST_PENDING && now > ev->burst_deadline_ns) {
 		pss_log("event %" PRIu64 ": camd result overdue, no images", ev->id);
 		ev->burst = BURST_DONE;
-		ev->flags |= PSS_EVF_NO_IMAGES;
 		h->cam_failures++;
 	}
 	if (ev->open && !ev->pir_high && ev->burst != BURST_PENDING &&
 	    now - ev->last_activity_ns >= h->quiet_ns && close_event(h, ev->last_activity_ns, 0) != 0)
 		return -1;
+	/* Repeat bursts, on a fixed schedule from the first so the count is
+	 * cap/interval (rounded up) whatever the tick phase. Checked after the
+	 * close above, so an event ready to close gets no extra burst. */
+	if (ev->open && ev->kind == PSS_EV_ENTRY && ev->bursts > 0 && ev->burst != BURST_PENDING &&
+	    arm_watching(&h->arm) && (int64_t)ev->bursts * h->reburst_ns < h->reburst_cap_ns &&
+	    now >= ev->first_burst_ns + (int64_t)ev->bursts * h->reburst_ns) {
+		pss_log("event %" PRIu64 ": still open, repeat burst %" PRIu32, ev->id, ev->bursts + 1);
+		trigger_burst(h, now);
+	}
 	if (now >= h->next_hb_ns) {
 		if (write_stats(h, now) != 0)
 			return -1;
@@ -633,11 +647,14 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		{ "t-co-ms", required_argument, NULL, 'T' },
 		{ "exit-delay-ms", required_argument, NULL, 'x' },
 		{ "grace-ms", required_argument, NULL, 'g' },
+		{ "reburst-ms", required_argument, NULL, 'r' },
+		{ "reburst-cap-ms", required_argument, NULL, 'R' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	uint32_t quiet_ms = 30000, quota_mb = 2048, t_co_ms = 5000, v;
 	uint32_t exit_delay_ms = 60000, grace_ms = 30000;
+	uint32_t reburst_ms = 60000, reburst_cap_ms = 300000;	/* 5 bursts, at 0-4 min */
 	int opt;
 
 	h->burst_frames = 20;
@@ -661,12 +678,16 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		case 'T': if (v < 1 || v > 60000) return -1; t_co_ms = v; break;
 		case 'x': if (v < 1 || v > 3600000) return -1; exit_delay_ms = v; break;
 		case 'g': if (v < 1 || v > 3600000) return -1; grace_ms = v; break;
+		case 'r': if (v < 1 || v > 3600000) return -1; reburst_ms = v; break;
+		case 'R': if (v > 3600000) return -1; reburst_cap_ms = v; break;	/* 0: one burst */
 		default: return -1;
 		}
 	}
 	arm_init(&h->arm, (int64_t)exit_delay_ms * PSS_NS_PER_MS, (int64_t)grace_ms * PSS_NS_PER_MS);
 	h->quiet_ns = (int64_t)quiet_ms * PSS_NS_PER_MS;
 	h->t_co_ns = (int64_t)t_co_ms * PSS_NS_PER_MS;
+	h->reburst_ns = (int64_t)reburst_ms * PSS_NS_PER_MS;
+	h->reburst_cap_ns = (int64_t)reburst_cap_ms * PSS_NS_PER_MS;
 	fusion_init(&h->fu, h->t_co_ns);
 	h->quota_bytes = (uint64_t)quota_mb * 1024 * 1024;
 	return 0;
@@ -730,10 +751,10 @@ int main(int argc, char **argv)
 
 	h->start_ns = pss_mono_ns();
 	h->next_hb_ns = h->start_ns + HB_FIRST_NS;
-	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms onset z>=%.0f +%.0fdB warmup=%" PRIu32 " t_co=%" PRId64 "ms",
+	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms onset z>=%.0f +%.0fdB warmup=%" PRIu32 " t_co=%" PRId64 "ms reburst=%" PRId64 "ms cap=%" PRId64 "ms",
 		(int)getpid(), pss_data_dir(), h->sock_path, h->quiet_ns / PSS_NS_PER_MS,
 		h->burst_frames, h->burst_interval_ms, h->onset_z, h->onset_db, h->mic_warmup,
-		h->t_co_ns / PSS_NS_PER_MS);
+		h->t_co_ns / PSS_NS_PER_MS, h->reburst_ns / PSS_NS_PER_MS, h->reburst_cap_ns / PSS_NS_PER_MS);
 
 	for (;;) {
 		struct epoll_event evs[16];
@@ -758,8 +779,6 @@ int main(int argc, char **argv)
 				else
 					pss_log("signal %u, shutting down", si.ssi_signo);
 				if (h->ev.open) {
-					if (h->ev.burst == BURST_PENDING)
-						h->ev.flags |= PSS_EVF_NO_IMAGES;
 					if (close_event(h, now, PSS_EVF_CLOSED_AT_SHUTDOWN) != 0)
 						goto out;
 				}

@@ -17,6 +17,16 @@ int clip_final_name(char *buf, size_t n, uint64_t event_id);
 
 /* Makes the burst durable under its final name; *n_images = number of *.jpg. 0 or -1. */
 int clip_commit(int clips_dir_fd, uint64_t event_id, uint32_t *n_images);
+/*
+ * Burst number burst_no (1-based) of an event that may already have a
+ * committed clips/<id>.dir. If it doesn't, this is clip_commit. Otherwise
+ * each file in clips/<id>.dir.tmp is fsynced and renamed into clips/<id>.dir
+ * as "b<burst_no>-<name>", then clips/<id>.dir is fsynced, the empty .tmp
+ * removed and clips/ fsynced. A crash midway leaves a partial burst (the rest
+ * stays in .tmp and is removed at startup); earlier bursts are untouched.
+ * *n_images = number of *.jpg added. 0 or -1.
+ */
+int clip_append(int clips_dir_fd, uint64_t event_id, uint32_t burst_no, uint32_t *n_images);
 /* Removes clips/<id>.dir.tmp if present. 0 or -1. */
 int clip_discard(int clips_dir_fd, uint64_t event_id);
 /* Removes every *.tmp entry (file or one-level dir), logging each. 0 or -1. */

@@ -423,6 +423,68 @@ static void test_clip_commit(void)
 	t_rm_rf(root);
 }
 
+/* Repeat bursts: same file names each burst, no clash, running total. */
+static void test_clip_append(void)
+{
+	char root[256];
+	struct pss_store s;
+	uint32_t n = 0;
+
+	t_mkdtemp(root);
+	CHECK(store_open(&s, root) == 0);
+	make_burst(root, "6.dir.tmp", 3, 100);
+	CHECK(clip_append(s.clips_dir_fd, 6, 1, &n) == 0);	/* no .dir yet: a plain commit */
+	CHECK(n == 3);
+	CHECK(exists(root, "clips/6.dir/img0002.jpg"));
+	make_burst(root, "6.dir.tmp", 2, 100);
+	CHECK(clip_append(s.clips_dir_fd, 6, 2, &n) == 0);
+	CHECK(n == 2);
+	make_burst(root, "6.dir.tmp", 2, 100);
+	CHECK(clip_append(s.clips_dir_fd, 6, 3, &n) == 0);
+	CHECK(n == 2);
+	CHECK(exists(root, "clips/6.dir/img0000.jpg"));
+	CHECK(exists(root, "clips/6.dir/b2-img0001.jpg"));
+	CHECK(exists(root, "clips/6.dir/b3-img0001.jpg"));
+	CHECK(!exists(root, "clips/6.dir.tmp"));
+	CHECK(clip_count_images(s.clips_dir_fd, 6, &n) == 0 && n == 7);
+	CHECK(clip_append(s.clips_dir_fd, 6, 4, &n) == -1);	/* nothing to append */
+	CHECK(clip_count_images(s.clips_dir_fd, 6, &n) == 0 && n == 7);
+	store_close(&s);
+	t_rm_rf(root);
+}
+
+/* Crash in the middle of an append: one file of burst 2 was renamed in, the
+ * other is still in .tmp. Startup drops the rest; burst 1 is untouched. */
+static void test_clip_append_interrupted(void)
+{
+	char root[256], path[512];
+	struct pss_store s;
+	uint32_t n = 0;
+
+	t_mkdtemp(root);
+	CHECK(store_open(&s, root) == 0);
+	make_burst(root, "8.dir.tmp", 3, 100);
+	CHECK(clip_append(s.clips_dir_fd, 8, 1, &n) == 0 && n == 3);
+	store_close(&s);
+	make_burst(root, "8.dir.tmp", 2, 100);
+	snprintf(path, sizeof path, "%s/clips/8.dir.tmp/img0000.jpg", root);
+	{
+		char dst[512];
+
+		snprintf(dst, sizeof dst, "%s/clips/8.dir/b2-img0000.jpg", root);
+		CHECK(rename(path, dst) == 0);
+	}
+
+	CHECK(store_open(&s, root) == 0);
+	CHECK(!exists(root, "clips/8.dir.tmp"));
+	CHECK(exists(root, "clips/8.dir/img0002.jpg"));
+	CHECK(exists(root, "clips/8.dir/b2-img0000.jpg"));
+	CHECK(clip_count_images(s.clips_dir_fd, 8, &n) == 0 && n == 4);
+	CHECK(s.next_event_id == 9);
+	store_close(&s);
+	t_rm_rf(root);
+}
+
 static void test_tmp_cleanup_on_open(void)
 {
 	char root[256], path[512];
@@ -486,6 +548,8 @@ int main(void)
 	T_RUN(test_stats_prune_old_segments);
 	T_RUN(test_stats_roll_by_age);
 	T_RUN(test_clip_commit);
+	T_RUN(test_clip_append);
+	T_RUN(test_clip_append_interrupted);
 	T_RUN(test_tmp_cleanup_on_open);
 	T_RUN(test_quota_evicts_oldest);
 	T_END();

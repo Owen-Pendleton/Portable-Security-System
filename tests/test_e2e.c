@@ -704,6 +704,99 @@ static void test_arm_decisions(void)
 	t_rm_rf(root);
 }
 
+/* Sound, then the person walks in and stays in view (PIR held high). */
+static void door_and_stay(int pfd, int mfd)
+{
+	send_mic_frame(mfd, 0.5, 5.0);
+	sleep_ms(100);
+	send_edge(pfd, 1);
+}
+
+/*
+ * Repeat bursts during a long ENTRY (DONEXT.md, agreed 2026-11-18): a burst
+ * every --reburst-ms while the event is open and the device is watching,
+ * none starting --reburst-cap-ms or more after the first. Scaled down here:
+ * every 1 s (the hub's tick), cap 3.5 s, so bursts at 0, 1, 2, 3 s = 4.
+ * Each fake burst is 3 images.
+ *  cap:    in view for 6 s: 4 bursts, 12 images, appended without clashes.
+ *  GRACE:  the owner disarms during GRACE: no more bursts, the first is kept.
+ *  short:  an event that ends before 1 s still gets exactly one burst.
+ */
+static void test_repeat_bursts(void)
+{
+	char root[256], data[300], run[300], fake[512], path[600], hub[512], camd[512], sock[300];
+	const char *bindir = getenv("PSS_BIN_DIR");
+	struct seen s;
+	uint32_t st = 999;
+	pid_t hp, cp;
+	int pfd, mfd, i;
+
+	t_mkdtemp(root);
+	snprintf(data, sizeof data, "%s/data", root);
+	snprintf(run, sizeof run, "%s/run", root);
+	snprintf(fake, sizeof fake, "%s/fake-rpicam-still.sh", getenv("PSS_TEST_DIR"));
+	CHECK(chmod(fake, 0755) == 0);
+	setenv("PSS_DATA_DIR", data, 1);
+	setenv("PSS_RUN_DIR", run, 1);
+	setenv("PSS_RPICAM", fake, 1);
+	unsetenv("FAKE_RPICAM_FAIL");
+	snprintf(hub, sizeof hub, "%s/hub", bindir);
+	snprintf(camd, sizeof camd, "%s/camd", bindir);
+
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
+			       "--warmup-frames=50", "--t-co-ms=500", "--exit-delay-ms=200", "--grace-ms=5000",
+			       "--reburst-ms=1000", "--reburst-cap-ms=3500", NULL });
+	CHECK(hp > 0);
+	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
+	pfd = connect_as(sock, PSS_ROLE_PIR);
+	mfd = connect_as(sock, PSS_ROLE_MIC);
+	cp = spawn((char *[]){ camd, NULL });
+	CHECK(cp > 0);
+	sleep_ms(1000);	/* let camd connect */
+	ensure_armed(data, pfd);	/* arm records: EXIT_DELAY, ARMED */
+	for (i = 0; i < 100; i++)	/* learn the room background */
+		send_fan(mfd, &st, 0.02);
+
+	/* cap: in view for 6 s, well past the 3.5 s cap. GRACE runs out at 5 s
+	 * (ARMED again), which is still watching. */
+	door_and_stay(pfd, mfd);
+	sleep_ms(6000);
+	send_edge(pfd, 0);
+	wait_events(data, 1, &s);
+	CHECK(s.last.kind == PSS_EV_ENTRY);
+	CHECK(s.last.n_images == 12);
+	CHECK(!(s.last.flags & PSS_EVF_NO_IMAGES));
+	snprintf(path, sizeof path, "%s/clips/%" PRIu64 ".dir", data, s.last.event_id);
+	CHECK(count_entries(path, ".jpg") == 12);
+	CHECK(count_entries(path, "-img0002.jpg") == 3);	/* b2-, b3-, b4- */
+	wait_arm(data, 4, ARM_ARMED, &s);
+
+	/* GRACE: the owner presses at once; in view 3 more s, but no more bursts. */
+	door_and_stay(pfd, mfd);
+	wait_arm(data, 5, ARM_GRACE, &s);
+	press(pfd);
+	wait_arm(data, 6, ARM_DISARMED, &s);
+	CHECK(s.last_arm.label == ARM_LABEL_OWNER);
+	sleep_ms(3000);
+	send_edge(pfd, 0);
+	wait_events(data, 2, &s);
+	check_entry_with_images(data, &s);	/* 3 images: the first burst only */
+
+	/* short: a quick walk-through gets its one burst and nothing more. */
+	ensure_armed(data, pfd);
+	door(pfd, mfd);
+	wait_events(data, 3, &s);
+	check_entry_with_images(data, &s);
+
+	snprintf(path, sizeof path, "%s/clips", data);
+	CHECK(count_entries(path, ".tmp") == 0);
+	CHECK(stop(cp) == 0);
+	CHECK(stop(hp) == 0);
+	close(pfd);
+	close(mfd);
+	t_rm_rf(root);
+}
+
 int main(void)
 {
 	if (getenv("PSS_BIN_DIR") == NULL || getenv("PSS_TEST_DIR") == NULL) {
@@ -714,5 +807,6 @@ int main(void)
 	T_RUN(test_sound_to_storage);
 	T_RUN(test_entry_to_storage);
 	T_RUN(test_arm_decisions);
+	T_RUN(test_repeat_bursts);
 	T_END();
 }
