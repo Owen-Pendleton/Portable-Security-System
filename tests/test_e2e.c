@@ -807,6 +807,85 @@ static void test_repeat_bursts(void)
 	t_rm_rf(root);
 }
 
+/* A TV or radio: speech bands ~+20 dB over a 0.02 room, the lowest band at
+ * the room's level, with some jitter. Sounds like voice to a quiet room. */
+static void send_tv_frame(int fd, uint32_t *st)
+{
+	struct pss_msg m;
+
+	pss_msg_init(&m, PSS_MSG_MIC_FRAME);
+	m.u.mic.rms = 0.2f;
+	m.u.mic.flux = (float)(0.3 + 0.1 * lcg_unit(st));
+	for (int b = 0; b < PSS_NBANDS; b++)
+		m.u.mic.band[b] = (float)((b == 0 ? -3.4 : b <= 5 ? -1.4 : -2.4) + 0.1 * lcg_unit(st));
+	for (int i = 0; i < 500; i++) {
+		if (ipc_send(fd, &m) == 0)
+			return;
+		if (errno != EAGAIN)
+			break;
+		sleep_ms(1);
+	}
+	CHECK(!"send_tv_frame failed");
+}
+
+/* Sends n TV frames over about ms milliseconds of wall time. */
+static void tv_for(int fd, uint32_t *st, int n, int ms)
+{
+	for (int i = 0; i < n; i++) {
+		send_tv_frame(fd, st);
+		if (i % 50 == 49)
+			sleep_ms(ms * 50 / n);
+	}
+}
+
+/*
+ * Option B (Bryan, 2026-11-18): the background keeps learning during a
+ * SOUND_ONLY event and stops only once there is motion. A TV switched on
+ * while armed opens a SOUND_ONLY event (it sounds like voice to a quiet
+ * room), then becomes the room's normal sound, so the event closes while
+ * the TV is still on and no new one opens. With learning frozen for every
+ * open event, that event would never close.
+ */
+static void test_tv_fades_into_background(void)
+{
+	char root[256], data[300], run[300], hub[512], sock[300];
+	const char *bindir = getenv("PSS_BIN_DIR");
+	struct seen s;
+	uint32_t st = 4242;
+	pid_t hp;
+	int pfd, mfd, i;
+
+	t_mkdtemp(root);
+	snprintf(data, sizeof data, "%s/data", root);
+	snprintf(run, sizeof run, "%s/run", root);
+	setenv("PSS_DATA_DIR", data, 1);
+	setenv("PSS_RUN_DIR", run, 1);
+	snprintf(hub, sizeof hub, "%s/hub", bindir);
+
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--warmup-frames=50", "--exit-delay-ms=200", NULL });
+	CHECK(hp > 0);
+	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
+	pfd = connect_as(sock, PSS_ROLE_PIR);	/* only to press the arm button */
+	mfd = connect_as(sock, PSS_ROLE_MIC);
+	ensure_armed(data, pfd);
+	/* A quiet room for a minute, so the background is past its fast
+	 * start-up learning (the first 3000 frames). */
+	for (i = 0; i < 3000; i++)
+		send_fan(mfd, &st, 0.02);
+
+	tv_for(mfd, &st, 3000, 2000);	/* TV on: 60 s of frames over 2 s */
+	tv_for(mfd, &st, 1000, 2000);	/* still on, 2 s more: the event closes */
+	CHECK(count_events(data, &s) == 1);
+	CHECK(s.last.kind == PSS_EV_SOUND_ONLY);
+	tv_for(mfd, &st, 1000, 1500);	/* still on: it is the room now */
+	CHECK(count_events(data, &s) == 1);
+
+	CHECK(stop(hp) == 0);
+	close(pfd);
+	close(mfd);
+	t_rm_rf(root);
+}
+
 int main(void)
 {
 	if (getenv("PSS_BIN_DIR") == NULL || getenv("PSS_TEST_DIR") == NULL) {
@@ -818,5 +897,6 @@ int main(void)
 	T_RUN(test_entry_to_storage);
 	T_RUN(test_arm_decisions);
 	T_RUN(test_repeat_bursts);
+	T_RUN(test_tv_fades_into_background);
 	T_END();
 }

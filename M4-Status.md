@@ -180,6 +180,11 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
   does, so the impulse can see its decay. Still to do: tune `K_imp` and
   `K_voice` on the Pi (door, talking, TV, HVAC) from the heartbeat's
   `imp_zmax` / `voice_zmax`.
+- Background keeps learning during SOUND_ONLY events, freezing only once
+  there is motion (Bryan, 2026-11-18; DESIGN.md Section 4). e2e
+  `test_tv_fades_into_background` fails without it (the event never
+  closes). A steady TV fades in about 7.5 s; so does continuous talking
+  with nobody in view.
 - Repeat bursts during a long ENTRY (Owen, 2026-11-18, commit c567880):
   see DONEXT.md; not yet checked on the Pi.
 - Capture a full Pi log of the three fusion cases for the record.

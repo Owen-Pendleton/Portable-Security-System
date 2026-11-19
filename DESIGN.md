@@ -158,6 +158,12 @@ As built (`src/analysis/audio.c`; Bryan, 2026-11-18). micd's band edges are
   ≥ 20 of the last 100 frames count. It feeds fusion on every frame while it
   lasts, so talking keeps an event open (T_quiet below).
 - Frames that are part of an impulse are never learned into the background.
+- Change from "updated only outside active events" (Bryan, 2026-11-18): the
+  background also keeps learning during a SOUND_ONLY event and stops only
+  once the event has motion. Otherwise a TV or radio switched on while armed
+  holds a SOUND_ONLY event open for as long as it plays (frozen background,
+  so it always sounds like voice), and any PIR rise then becomes an ENTRY.
+  Measured: a steady TV stops counting as voice after about 7.5 s of play.
 - `K_imp` and `K_voice` are starting values; the hub heartbeat logs the
   largest scores heard (`imp_zmax`, `voice_zmax`) for tuning on the Pi.
 - *PIR:* HC-SR501 in **single-trigger mode** with the delay pot at minimum, so

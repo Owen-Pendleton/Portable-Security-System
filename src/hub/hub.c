@@ -358,9 +358,14 @@ static void on_sound(struct hub *h, int64_t ts, int64_t now)
 static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 {
 	struct audio_result r;
+	/* The background stops learning only once there is motion, so a person
+	 * in view stays unusual. During a sound-only event it keeps learning, so
+	 * a TV or radio left on becomes the room's normal sound instead of
+	 * holding the event open (Bryan, 2026-11-18). */
+	int learn = !h->ev.open || h->ev.pir_edges == 0;
 
 	h->mic_frames++;
-	if (audio_frame(&h->mic, m->mono_ns, m->u.mic.flux, m->u.mic.band, !h->ev.open, &r) != 0) {
+	if (audio_frame(&h->mic, m->mono_ns, m->u.mic.flux, m->u.mic.band, learn, &r) != 0) {
 		pss_log("micd: non-finite frame ignored");
 		return;
 	}
