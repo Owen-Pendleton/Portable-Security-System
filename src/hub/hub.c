@@ -4,20 +4,22 @@
  * burst per event, and commits everything through the store (mechanism D).
  *
  * Fusion (DESIGN.md Section 4, src/analysis/fusion.c): a PIR rise opens a
- * MOTION_ONLY event and a sound onset (below) opens a SOUND_ONLY event, but
- * neither takes images. Only when a rise and an onset fall within +-T_co of
+ * MOTION_ONLY event and a sound (an impulse or voice, below) opens a
+ * SOUND_ONLY event, but neither takes images. Only when a rise and a sound
+ * fall within +-T_co of
  * each other (either order) does the event become an ENTRY: it is made
  * durable at once and camd is asked for a burst. While the ENTRY stays open
  * and the device is watching, a burst repeats every --reburst-ms after the
  * first, until --reburst-cap-ms after it (default: at 0-4 min, 5 bursts).
  * Repeat bursts are appended to the same clips/<id>.dir (clip_append).
  *
- * M3 sound trigger (stand-in for DESIGN.md Section 4's detectors, M4): an
- * EWMA background model of spectral flux and log RMS, learned only while no
- * event is open. A frame is an onset when its flux z-score and its loudness
- * above the room background both pass thresholds, so steady noise (fans,
- * AC) never triggers: its flux stays near its own mean and its level is the
- * background. Thresholds are placeholders until tuned on Pi recordings.
+ * Sound (DESIGN.md Section 4, src/analysis/audio.c): a per-band background
+ * model, learned only while no event is open, and two detectors on it: an
+ * impulse (latch, door: sudden, broadband, gone within 140 ms) and voice
+ * (speech bands up for 400 ms within 2 s, not led by low rumble). An impulse
+ * counts once; voice counts on every frame while it lasts, so talking keeps
+ * an event open. --k-imp and --k-voice are placeholders until tuned on Pi
+ * recordings (the heartbeat logs the largest scores heard).
  *
  * Arm state (DESIGN.md Section 4, src/analysis/arm.c): pird's button presses
  * and confirmed entries drive it, and every change is made durable as a
@@ -30,6 +32,7 @@
  * failure, so the supervisor restarts us and recovery runs), 2 on usage.
  */
 #include "analysis/arm.h"
+#include "analysis/audio.h"
 #include "analysis/fusion.h"
 #include "common/ipc.h"
 #include "common/log.h"
@@ -42,7 +45,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
-#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,10 +62,6 @@
 #define SUPHB_EVERY_NS (5 * PSS_NS_PER_S)	/* to the supervisor, like every daemon */
 #define BURST_SLACK_NS (20 * PSS_NS_PER_S)
 #define BURST_EST_BYTES (9ull * 1024 * 1024)	/* upper end of DESIGN.md Section 5's 6-9 MB */
-#define MIC_ALPHA_MIN (1.0 / 3000)	/* 60 s time constant at 50 frames/s */
-#define MIC_FLUX_VAR_FLOOR (0.05 * 0.05)
-#define MIC_LRMS_VAR_FLOOR (0.01 * 0.01)
-#define MIC_RMS_FLOOR 1e-6		/* keeps log10 finite on digital silence */
 
 enum { TAG_LISTEN = MAX_CONNS, TAG_SIG, TAG_TICK };
 
@@ -92,32 +90,22 @@ struct event {
 	int64_t first_burst_ns;
 };
 
-/* EWMA mean/variance of flux and log10(rms), learned outside events. */
-struct mic_bg {
-	uint64_t n;
-	double flux_mu, flux_var;
-	double lrms_mu, lrms_var;
-	double z_max, db_max;	/* largest scores since the last heartbeat, for tuning */
-};
-
 struct hub {
 	struct pss_store store;
 	int store_open;
 	int listen_fd, epoll_fd, sig_fd, tick_fd;
 	struct conn conns[MAX_CONNS];
 	struct event ev;
-	struct mic_bg mic;
+	struct audio mic;	/* background model + impulse/voice detectors (and their config) */
 	struct fusion fu;
 	struct arm arm;
 	int fatal;		/* a store write failed inside a handler: exit so recovery runs */
 	int64_t start_ns, next_hb_ns, next_suphb_ns;
-	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_onsets;
+	uint64_t pir_edges, mic_frames, cam_bursts, cam_failures, events_closed, mic_impulses, mic_voices;
 	/* config */
 	int64_t quiet_ns, t_co_ns, reburst_ns, reburst_cap_ns;
 	uint32_t burst_frames, burst_interval_ms, floor_pct;
 	uint64_t quota_bytes;
-	double onset_z, onset_db;
-	uint32_t mic_warmup;
 	char sock_path[108];
 };
 
@@ -127,7 +115,7 @@ static void usage(void)
 {
 	fprintf(stderr, "usage: hub [--quiet-ms=30000] [--burst-frames=20] [--burst-interval-ms=500]\n"
 			"           [--quota-mb=2048] [--floor-pct=5]\n"
-			"           [--onset-z=6] [--onset-db=10] [--warmup-frames=250] [--t-co-ms=5000]\n"
+			"           [--k-imp=6] [--k-voice=3] [--warmup-frames=250] [--t-co-ms=5000]\n"
 			"           [--exit-delay-ms=60000] [--grace-ms=30000]\n"
 			"           [--reburst-ms=60000] [--reburst-cap-ms=300000]\n");
 }
@@ -351,62 +339,43 @@ static void on_pir_edge(struct hub *h, const struct pss_msg *m, int64_t now)
 	}
 }
 
-static void mic_bg_update(struct mic_bg *b, double flux, double lrms)
+/* An impulse or voice at ts (sensor time): fusion's audio input. Opens a
+ * SOUND_ONLY event if none is open, else keeps the open one alive. */
+static void on_sound(struct hub *h, int64_t ts, int64_t now)
 {
-	double a, d;
+	struct event *ev = &h->ev;
+	int64_t dt = 0;
+	int hit = fusion_onset(&h->fu, ts, &dt);
 
-	b->n++;
-	a = 1.0 / (double)b->n;
-	if (a < MIC_ALPHA_MIN)
-		a = MIC_ALPHA_MIN;
-	d = flux - b->flux_mu;
-	b->flux_mu += a * d;
-	b->flux_var = (1.0 - a) * (b->flux_var + a * d * d);
-	d = lrms - b->lrms_mu;
-	b->lrms_mu += a * d;
-	b->lrms_var = (1.0 - a) * (b->lrms_var + a * d * d);
+	if (ev->open)
+		ev->last_activity_ns = now;
+	else if (arm_watching(&h->arm))	/* nothing is recorded while not armed */
+		open_event(h, ts, now, 0);
+	if (hit)
+		confirm_entry(h, dt, now);
 }
 
 static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 {
-	struct mic_bg *b = &h->mic;
-	struct event *ev = &h->ev;
-	double flux = m->u.mic.flux;
-	double rms = m->u.mic.rms;
-	double lrms, z, db;
-	int onset;
+	struct audio_result r;
 
 	h->mic_frames++;
-	if (!isfinite(flux) || !isfinite(rms) || rms < 0) {
+	if (audio_frame(&h->mic, m->mono_ns, m->u.mic.flux, m->u.mic.band, !h->ev.open, &r) != 0) {
 		pss_log("micd: non-finite frame ignored");
 		return;
 	}
-	lrms = log10(rms > MIC_RMS_FLOOR ? rms : MIC_RMS_FLOOR);
-	z = (flux - b->flux_mu) / sqrt(b->flux_var > MIC_FLUX_VAR_FLOOR ? b->flux_var : MIC_FLUX_VAR_FLOOR);
-	db = 20.0 * (lrms - b->lrms_mu);
-	onset = b->n >= h->mic_warmup && z >= h->onset_z && db >= h->onset_db;
-	if (b->n >= h->mic_warmup && !ev->open) {
-		if (z > b->z_max)
-			b->z_max = z;
-		if (db > b->db_max)
-			b->db_max = db;
+	if (r.flags & AUDIO_IMPULSE) {
+		h->mic_impulses++;
+		pss_log("impulse: flux z=%.1f, decayed within %d ms", r.impulse_z, AUDIO_DECAY_FRAMES * 20);
+		on_sound(h, r.impulse_ns, now);
 	}
-	if (onset) {
-		int64_t dt = 0;
-		int hit = fusion_onset(&h->fu, m->mono_ns, &dt);
-
-		h->mic_onsets++;
-		pss_log("sound onset: flux z=%.1f, +%.1f dB over background", z, db);
-		if (ev->open)
-			ev->last_activity_ns = now;
-		else if (arm_watching(&h->arm))	/* nothing is recorded while not armed */
-			open_event(h, m->mono_ns, now, 0);
-		if (hit)
-			confirm_entry(h, dt, now);
-		return;
+	if (r.flags & AUDIO_VOICE_START) {
+		h->mic_voices++;
+		pss_log("voice: speech bands z=%.1f, %d of the last %d frames", r.voice_z, AUDIO_VOICE_MIN,
+			AUDIO_VOICE_WIN);
 	}
-	if (!ev->open)
-		mic_bg_update(b, flux, lrms);
+	if (r.flags & AUDIO_VOICE)	/* every frame while voice lasts */
+		on_sound(h, m->mono_ns, now);
 }
 
 static void conn_drop(struct hub *h, int idx, const char *why)
@@ -427,7 +396,8 @@ static void conn_drop(struct hub *h, int idx, const char *why)
 		fusion_forget(&h->fu, 1, 0);
 	}
 	if (c->role == PSS_ROLE_MIC) {
-		memset(&h->mic, 0, sizeof h->mic); /* relearn: the device or room may differ */
+		/* relearn: the device or room may differ */
+		audio_init(&h->mic, h->mic.k_imp, h->mic.k_voice, h->mic.warmup);
 		fusion_forget(&h->fu, 0, 1);
 	}
 	c->fd = -1;
@@ -560,13 +530,13 @@ static int write_stats(struct hub *h, int64_t now)
 	    store_sync(&h->store, PSS_LOG_STATS) != 0)
 		return -1;
 	pss_log("hb: up=%" PRId64 "s pird=%s camd=%s micd=%s edges=%" PRIu64 " events=%" PRIu64
-		" bursts=%" PRIu64 " cam_fail=%" PRIu64 " mic_frames=%" PRIu64 " mic_onsets=%" PRIu64
-		" mic_zmax=%.1f mic_dbmax=%.1f",
+		" bursts=%" PRIu64 " cam_fail=%" PRIu64 " mic_frames=%" PRIu64 " impulses=%" PRIu64
+		" voices=%" PRIu64 " imp_zmax=%.1f voice_zmax=%.1f",
 		(now - h->start_ns) / PSS_NS_PER_S, alive_str(h, PSS_ROLE_PIR, now),
 		alive_str(h, PSS_ROLE_CAM, now), alive_str(h, PSS_ROLE_MIC, now),
-		h->pir_edges, h->events_closed, h->cam_bursts, h->cam_failures, h->mic_frames, h->mic_onsets,
-		h->mic.z_max, h->mic.db_max);
-	h->mic.z_max = h->mic.db_max = 0;
+		h->pir_edges, h->events_closed, h->cam_bursts, h->cam_failures, h->mic_frames, h->mic_impulses,
+		h->mic_voices, h->mic.imp_zmax, h->mic.voice_zmax);
+	h->mic.imp_zmax = h->mic.voice_zmax = 0;
 	return 0;
 }
 
@@ -641,8 +611,8 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		{ "burst-interval-ms", required_argument, NULL, 'i' },
 		{ "quota-mb", required_argument, NULL, 'Q' },
 		{ "floor-pct", required_argument, NULL, 'F' },
-		{ "onset-z", required_argument, NULL, 'z' },
-		{ "onset-db", required_argument, NULL, 'd' },
+		{ "k-imp", required_argument, NULL, 'z' },
+		{ "k-voice", required_argument, NULL, 'd' },
 		{ "warmup-frames", required_argument, NULL, 'w' },
 		{ "t-co-ms", required_argument, NULL, 'T' },
 		{ "exit-delay-ms", required_argument, NULL, 'x' },
@@ -655,14 +625,15 @@ static int parse_args(struct hub *h, int argc, char **argv)
 	uint32_t quiet_ms = 30000, quota_mb = 2048, t_co_ms = 5000, v;
 	uint32_t exit_delay_ms = 60000, grace_ms = 30000;
 	uint32_t reburst_ms = 60000, reburst_cap_ms = 300000;	/* 5 bursts, at 0-4 min */
+	uint32_t k_imp, k_voice, warmup;
 	int opt;
 
 	h->burst_frames = 20;
 	h->burst_interval_ms = 500;
 	h->floor_pct = 5;
-	h->onset_z = 6;		/* placeholder: tune from Pi recordings */
-	h->onset_db = 10;	/* placeholder: tune from Pi recordings */
-	h->mic_warmup = 250;	/* 5 s of background before any onset */
+	k_imp = 6;		/* placeholder: tune from Pi recordings */
+	k_voice = 3;		/* placeholder: tune from Pi recordings */
+	warmup = 250;		/* 5 s of background before any detection */
 	while ((opt = getopt_long(argc, argv, "", opts, NULL)) != -1) {
 		if (opt != 'h' && opt != '?' && pss_parse_u32(optarg, 0, UINT32_MAX, &v) != 0)
 			opt = '?';
@@ -672,9 +643,9 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		case 'i': if (v < 1 || v > 10000) return -1; h->burst_interval_ms = v; break;
 		case 'Q': quota_mb = v; break;
 		case 'F': if (v > 100) return -1; h->floor_pct = v; break;
-		case 'z': if (v < 1 || v > 1000) return -1; h->onset_z = v; break;
-		case 'd': if (v > 120) return -1; h->onset_db = v; break;
-		case 'w': if (v < 1) return -1; h->mic_warmup = v; break;
+		case 'z': if (v < 1 || v > 1000) return -1; k_imp = v; break;
+		case 'd': if (v < 1 || v > 1000) return -1; k_voice = v; break;
+		case 'w': if (v < 1) return -1; warmup = v; break;
 		case 'T': if (v < 1 || v > 60000) return -1; t_co_ms = v; break;
 		case 'x': if (v < 1 || v > 3600000) return -1; exit_delay_ms = v; break;
 		case 'g': if (v < 1 || v > 3600000) return -1; grace_ms = v; break;
@@ -689,6 +660,7 @@ static int parse_args(struct hub *h, int argc, char **argv)
 	h->reburst_ns = (int64_t)reburst_ms * PSS_NS_PER_MS;
 	h->reburst_cap_ns = (int64_t)reburst_cap_ms * PSS_NS_PER_MS;
 	fusion_init(&h->fu, h->t_co_ns);
+	audio_init(&h->mic, k_imp, k_voice, warmup);
 	h->quota_bytes = (uint64_t)quota_mb * 1024 * 1024;
 	return 0;
 }
@@ -751,9 +723,9 @@ int main(int argc, char **argv)
 
 	h->start_ns = pss_mono_ns();
 	h->next_hb_ns = h->start_ns + HB_FIRST_NS;
-	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms onset z>=%.0f +%.0fdB warmup=%" PRIu32 " t_co=%" PRId64 "ms reburst=%" PRId64 "ms cap=%" PRId64 "ms",
+	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms k_imp=%.0f k_voice=%.0f warmup=%" PRIu32 " t_co=%" PRId64 "ms reburst=%" PRId64 "ms cap=%" PRId64 "ms",
 		(int)getpid(), pss_data_dir(), h->sock_path, h->quiet_ns / PSS_NS_PER_MS,
-		h->burst_frames, h->burst_interval_ms, h->onset_z, h->onset_db, h->mic_warmup,
+		h->burst_frames, h->burst_interval_ms, h->mic.k_imp, h->mic.k_voice, h->mic.warmup,
 		h->t_co_ns / PSS_NS_PER_MS, h->reburst_ns / PSS_NS_PER_MS, h->reburst_cap_ns / PSS_NS_PER_MS);
 
 	for (;;) {

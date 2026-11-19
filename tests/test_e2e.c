@@ -337,6 +337,16 @@ static void send_fan(int fd, uint32_t *st, double rms_lvl)
 	send_mic_frame(fd, rms_lvl * (1.0 + 0.1 * lcg_unit(st)), 0.3 + 0.1 * lcg_unit(st));
 }
 
+/* A clap or door latch: one broadband jump (big flux, ~+28 dB over a 0.02
+ * room), then 200 ms of the room again, as a real micd keeps sending. The
+ * impulse detector needs the fall that follows to confirm it. */
+static void send_clap(int fd)
+{
+	send_mic_frame(fd, 0.5, 5.0);
+	for (int i = 0; i < 10; i++)
+		send_mic_frame(fd, 0.02, 0.3);
+}
+
 static int count_events(const char *data, struct seen *out)
 {
 	memset(out, 0, sizeof *out);
@@ -367,7 +377,7 @@ static void test_sound_to_storage(void)
 	snprintf(camd, sizeof camd, "%s/camd", bindir);
 
 	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--burst-frames=3", "--burst-interval-ms=20",
-			       "--warmup-frames=250", "--onset-z=6", "--onset-db=10", "--exit-delay-ms=200", NULL });
+			       "--warmup-frames=250", "--k-imp=6", "--k-voice=3", "--exit-delay-ms=200", NULL });
 	CHECK(hp > 0);
 	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
 	fd = connect_retry(sock);
@@ -475,7 +485,7 @@ static void entry_session(const char *data, int cam_fail)
 		send_fan(mfd, &st, 0.02);
 
 	/* (a) Door: latch sound first, then the person walks into view. */
-	send_mic_frame(mfd, 0.5, 5.0);
+	send_clap(mfd);
 	sleep_ms(100);
 	send_edge(pfd, 1);
 	sleep_ms(50);
@@ -494,7 +504,7 @@ static void entry_session(const char *data, int cam_fail)
 	/* (b) Motion first, then the sound 200 ms later. */
 	send_edge(pfd, 1);
 	sleep_ms(200);
-	send_mic_frame(mfd, 0.5, 5.0);
+	send_clap(mfd);
 	sleep_ms(50);
 	send_edge(pfd, 0);
 	wait_events(data, n0 + 2, &s);
@@ -504,7 +514,7 @@ static void entry_session(const char *data, int cam_fail)
 	 * stays high in between so both land in one event. */
 	send_edge(pfd, 1);
 	sleep_ms(1000);
-	send_mic_frame(mfd, 0.5, 5.0);
+	send_clap(mfd);
 	sleep_ms(50);
 	send_edge(pfd, 0);
 	wait_events(data, n0 + 3, &s);
@@ -563,7 +573,7 @@ static void kill_hard(pid_t pid)
 /* Door latch, then the person walks into view (an ENTRY if armed). */
 static void door(int pfd, int mfd)
 {
-	send_mic_frame(mfd, 0.5, 5.0);
+	send_clap(mfd);
 	sleep_ms(100);
 	send_edge(pfd, 1);
 	sleep_ms(50);
@@ -707,7 +717,7 @@ static void test_arm_decisions(void)
 /* Sound, then the person walks in and stays in view (PIR held high). */
 static void door_and_stay(int pfd, int mfd)
 {
-	send_mic_frame(mfd, 0.5, 5.0);
+	send_clap(mfd);
 	sleep_ms(100);
 	send_edge(pfd, 1);
 }

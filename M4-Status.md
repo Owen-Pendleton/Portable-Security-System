@@ -170,8 +170,18 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
   who times the blink).
 - `pss arm` / `pss disarm`: needs a new message or role in the shared
   `src/common/ipc.h` (agree with Owen first).
-- Impulse and voice detectors (DESIGN.md Section 4) still to replace the
-  M3 sound onset as fusion's audio input.
+- Done (Bryan, 2026-11-18): impulse and voice detectors
+  (`src/analysis/audio.c`, DESIGN.md Section 4) replace the M3 sound onset
+  as fusion's audio input. Hub flags `--onset-z`/`--onset-db` became
+  `--k-imp=6`/`--k-voice=3`. Unit tests in `tests/test_audio.c` (door
+  click, beep, slow thump, swell, speech, cough, HVAC rumble, learning);
+  each rule was broken on purpose to confirm a test catches it. The e2e
+  helpers now send 200 ms of room sound after each clap, as real micd
+  does, so the impulse can see its decay. Still to do: tune `K_imp` and
+  `K_voice` on the Pi (door, talking, TV, HVAC) from the heartbeat's
+  `imp_zmax` / `voice_zmax`.
+- Repeat bursts during a long ENTRY (Owen, 2026-11-18, commit c567880):
+  see DONEXT.md; not yet checked on the Pi.
 - Capture a full Pi log of the three fusion cases for the record.
 - RTC cell type, to decide on charging.
 - Known from M3: bursts give 18 of 20 frames (camd). Deferred: the

@@ -146,6 +146,20 @@ same device works next to a loud HVAC unit and in a silent room.
   under 150 ms.
 - *Voice:* z-score in the 300–3400 Hz bands above `K_voice` for ≥ 400 ms within
   2 s, with sub-200 Hz energy not dominant (rules out HVAC).
+
+As built (`src/analysis/audio.c`; Bryan, 2026-11-18). micd's band edges are
+100, 173, 299, 518, 894, 1546, 2675, 4627, 8000 Hz, so:
+- *Impulse:* flux z ≥ `K_imp` (default 6), at least 5 of the 8 bands at
+  z ≥ 3, and the mean band level falls ≥ 10 dB within 7 frames (140 ms).
+  Reported with the loud frame's timestamp, so fusion sees the true time.
+- *Voice:* the speech bands are bands 2–5 (299–2675 Hz). A frame counts when
+  their mean z is ≥ `K_voice` (default 3) and band 0 (100–173 Hz; nothing
+  below 100 Hz is measured) rose less than they did. Voice is detected while
+  ≥ 20 of the last 100 frames count. It feeds fusion on every frame while it
+  lasts, so talking keeps an event open (T_quiet below).
+- Frames that are part of an impulse are never learned into the background.
+- `K_imp` and `K_voice` are starting values; the hub heartbeat logs the
+  largest scores heard (`imp_zmax`, `voice_zmax`) for tuning on the Pi.
 - *PIR:* HC-SR501 in **single-trigger mode** with the delay pot at minimum, so
   each detection is a pulse of a few seconds followed by a ~2.5 s low block
   time, even under continuous motion. A person moving around produces a train

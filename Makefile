@@ -28,7 +28,7 @@ ifeq ($(HAVE_ALSA),y)
 BINS += $(BUILD)/micd
 endif
 
-TESTS     := test_store test_ipc test_pir_logic test_button_logic test_features test_fusion test_arm test_sup_policy test_e2e test_supervisor
+TESTS     := test_store test_ipc test_pir_logic test_button_logic test_features test_fusion test_audio test_arm test_sup_policy test_e2e test_supervisor
 TEST_BINS := $(addprefix $(BUILD)/tests/,$(TESTS))
 TEST_ENV  := PSS_BIN_DIR=$(abspath $(BUILD)) PSS_TEST_DIR=$(CURDIR)/tests
 
@@ -53,7 +53,7 @@ $(BUILD)/obj/tests/%.o: tests/%.c
 $(BUILD)/obj/capture/pir/pird.o: CFLAGS += $(shell pkg-config --cflags libgpiod 2>/dev/null)
 $(BUILD)/obj/capture/mic/micd.o: CFLAGS += $(shell pkg-config --cflags alsa 2>/dev/null)
 
-$(BUILD)/hub: $(call obj,hub/hub analysis/fusion analysis/arm $(COMMON) $(STORE))
+$(BUILD)/hub: $(call obj,hub/hub analysis/fusion analysis/arm analysis/audio $(COMMON) $(STORE))
 	$(CC) $(LDFLAGS) $^ -o $@ -lm
 
 $(BUILD)/camd: $(call obj,capture/cam/camd $(COMMON) store/dirlist store/clip)
@@ -78,6 +78,7 @@ $(BUILD)/tests/test_button_logic: $(call obj,tests/test_button_logic capture/pir
 $(BUILD)/tests/test_features: $(call obj,tests/test_features capture/mic/features $(COMMON))
 $(BUILD)/tests/test_fusion: $(call obj,tests/test_fusion analysis/fusion $(COMMON))
 $(BUILD)/tests/test_arm: $(call obj,tests/test_arm analysis/arm $(COMMON))
+$(BUILD)/tests/test_audio: $(call obj,tests/test_audio analysis/audio $(COMMON))
 $(BUILD)/tests/test_e2e: $(call obj,tests/test_e2e analysis/arm $(COMMON) $(STORE))
 $(BUILD)/tests/test_sup_policy: $(call obj,tests/test_sup_policy supervisor/policy $(COMMON))
 $(BUILD)/tests/test_supervisor: $(call obj,tests/test_supervisor $(COMMON))
