@@ -3,6 +3,45 @@
 Read CLAUDE.md, M4-Status.md and this file before starting. main was at
 the commit that added this file; `git pull` first.
 
+## PLAN TO THE END (agreed 2026-11-18; M5 due Wed Dec 9, demo day after)
+We resume **Tue Dec 1** and work each day as much as we can until done.
+Work in this order; each step needs the ones above it.
+
+**Before code freeze (Pi + code):**
+1. Tuning: Owen runs the tuning session below, Bryan sets `--k-imp` /
+   `--k-voice` from `tune.txt`.
+2. `pss status` (honest sensor states) + `pss timeline`. Agree the hub
+   query message in `ipc.h` first (both of us). Owen does Pi steps 1, 6,
+   7, 8 meanwhile.
+3. Accuracy trials together (~30 x 5 cases): one acts, one logs on paper.
+4. Sensor health (PIR SUSPECT, audio DEGRADED/RECOVERED) + OFFLINE spans;
+   `make memcheck`.
+5. Pi measurements: IRQ vs poll (idle + loaded), power pulls, kill -9,
+   unplugs.
+6. README.md: a clean Pi to a running system, no help needed.
+7. **Code freeze and start the 48 h soak: Wed Dec 2 preferred, Thu Dec 3
+   evening at the latest** (so a failed run can be redone).
+
+**After freeze (no code changes):**
+8. Unplug the mic for 10 min during the soak (the required injected fault).
+9. EVALUATION.md; DESIGN.md changelog (including the cuts below).
+10. PROMPTLOG.md and REFLECTION.md, each of us our own.
+11. Copy the raw soak logs and transcripts into the repo.
+12. Rehearse the demo: someone unplugs a sensor, `pss status` shows it;
+    each of us practises a small live change in our own code.
+
+If behind on Wed evening: start the soak anyway and record the rest as cut.
+
+**Cut, per the course spec** (record each in the DESIGN.md changelog):
+phone page and hotspot (spec: a CLI is a valid interface), audio WAV
+clips (not in the spec; photos cover mechanism D), routine/UNEXPECTED
+times (`pss expect`), probably the LED.
+
+**Owen, before the break (5 min, optional):** `git pull && make`, then
+`sudo systemctl restart pss`, and leave the Pi plugged in. It soaks the
+current code until Dec 1; check `journalctl -u pss` then for leaks or
+crashes.
+
 ## Done today
 - **Arm button in pird** (Owen): GPIO27 debounced at 20 ms (kernel +
   software), one `PSS_MSG_BUTTON` per press. Verified on the Pi: 20/20
