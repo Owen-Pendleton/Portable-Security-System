@@ -106,6 +106,7 @@ struct hub {
 	int64_t quiet_ns, t_co_ns, reburst_ns, reburst_cap_ns;
 	uint32_t burst_frames, burst_interval_ms, floor_pct;
 	uint64_t quota_bytes;
+	int tune;		/* --tune: log every sound that comes close, and why */
 	char sock_path[108];
 };
 
@@ -117,7 +118,7 @@ static void usage(void)
 			"           [--quota-mb=2048] [--floor-pct=5]\n"
 			"           [--k-imp=6] [--k-voice=3] [--warmup-frames=250] [--t-co-ms=5000]\n"
 			"           [--exit-delay-ms=60000] [--grace-ms=30000]\n"
-			"           [--reburst-ms=60000] [--reburst-cap-ms=300000]\n");
+			"           [--reburst-ms=60000] [--reburst-cap-ms=300000] [--tune]\n");
 }
 
 static struct conn *conn_for_role(struct hub *h, uint32_t role)
@@ -355,6 +356,40 @@ static void on_sound(struct hub *h, int64_t ts, int64_t now)
 		confirm_entry(h, dt, now);
 }
 
+/* --tune: one line per sound that came close to a threshold, with its
+ * scores and the reason it did or didn't count, for picking --k-imp and
+ * --k-voice from a Pi session. */
+static void log_tune(const struct hub *h, const struct audio_result *r)
+{
+	switch (r->tune_imp) {
+	case AUDIO_TUNE_NONE:
+		break;
+	case AUDIO_TUNE_YES:
+		pss_log("tune: impulse? flux z=%.1f (k_imp %.0f), %d/%d bands, fell %.0f dB in %d ms -> YES",
+			r->tune_imp_z, h->mic.k_imp, r->tune_imp_bands, PSS_NBANDS, r->tune_fall_db, r->tune_fall_ms);
+		break;
+	case AUDIO_TUNE_NO_FLUX:
+		pss_log("tune: impulse? flux z=%.1f (k_imp %.0f), %d/%d bands -> no (flux z below k_imp)",
+			r->tune_imp_z, h->mic.k_imp, r->tune_imp_bands, PSS_NBANDS);
+		break;
+	case AUDIO_TUNE_NO_BROAD:
+		pss_log("tune: impulse? flux z=%.1f (k_imp %.0f), %d/%d bands -> no (not broadband, needs %d)",
+			r->tune_imp_z, h->mic.k_imp, r->tune_imp_bands, PSS_NBANDS, AUDIO_BROAD_MIN);
+		break;
+	case AUDIO_TUNE_NO_DECAY:
+		pss_log("tune: impulse? flux z=%.1f (k_imp %.0f), %d/%d bands, fell only %.0f dB in %d ms -> no (needs %.0f dB)",
+			r->tune_imp_z, h->mic.k_imp, r->tune_imp_bands, PSS_NBANDS, r->tune_fall_db,
+			AUDIO_DECAY_FRAMES * 20, AUDIO_DECAY_DB);
+		break;
+	}
+	if (r->tune_voice)
+		pss_log("tune: voice? last 1 s: speech z max=%.1f (k_voice %.0f), low band z=%.1f, %" PRIu32
+			" frames counted, %" PRIu32 "/%d in 2 s (needs %d)%s",
+			r->tune_vz_max, h->mic.k_voice, r->tune_low_z, r->tune_counted, r->tune_window,
+			AUDIO_VOICE_WIN, AUDIO_VOICE_MIN,
+			r->tune_low_z >= r->tune_vz_max ? " (low band led: rumble)" : "");
+}
+
 static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 {
 	struct audio_result r;
@@ -369,6 +404,8 @@ static void on_mic_frame(struct hub *h, const struct pss_msg *m, int64_t now)
 		pss_log("micd: non-finite frame ignored");
 		return;
 	}
+	if (h->tune)
+		log_tune(h, &r);
 	if (r.flags & AUDIO_IMPULSE) {
 		h->mic_impulses++;
 		pss_log("impulse: flux z=%.1f, decayed within %d ms", r.impulse_z, AUDIO_DECAY_FRAMES * 20);
@@ -624,6 +661,7 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		{ "grace-ms", required_argument, NULL, 'g' },
 		{ "reburst-ms", required_argument, NULL, 'r' },
 		{ "reburst-cap-ms", required_argument, NULL, 'R' },
+		{ "tune", no_argument, NULL, 'u' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -640,7 +678,7 @@ static int parse_args(struct hub *h, int argc, char **argv)
 	k_voice = 3;		/* placeholder: tune from Pi recordings */
 	warmup = 250;		/* 5 s of background before any detection */
 	while ((opt = getopt_long(argc, argv, "", opts, NULL)) != -1) {
-		if (opt != 'h' && opt != '?' && pss_parse_u32(optarg, 0, UINT32_MAX, &v) != 0)
+		if (opt != 'h' && opt != '?' && opt != 'u' && pss_parse_u32(optarg, 0, UINT32_MAX, &v) != 0)
 			opt = '?';
 		switch (opt) {
 		case 'q': quiet_ms = v; break;
@@ -656,6 +694,7 @@ static int parse_args(struct hub *h, int argc, char **argv)
 		case 'g': if (v < 1 || v > 3600000) return -1; grace_ms = v; break;
 		case 'r': if (v < 1 || v > 3600000) return -1; reburst_ms = v; break;
 		case 'R': if (v > 3600000) return -1; reburst_cap_ms = v; break;	/* 0: one burst */
+		case 'u': h->tune = 1; break;
 		default: return -1;
 		}
 	}
@@ -728,10 +767,11 @@ int main(int argc, char **argv)
 
 	h->start_ns = pss_mono_ns();
 	h->next_hb_ns = h->start_ns + HB_FIRST_NS;
-	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms k_imp=%.0f k_voice=%.0f warmup=%" PRIu32 " t_co=%" PRId64 "ms reburst=%" PRId64 "ms cap=%" PRId64 "ms",
+	pss_log("start pid=%d data=%s sock=%s quiet=%" PRId64 "ms burst=%" PRIu32 "x%" PRIu32 "ms k_imp=%.0f k_voice=%.0f warmup=%" PRIu32 " t_co=%" PRId64 "ms reburst=%" PRId64 "ms cap=%" PRId64 "ms%s",
 		(int)getpid(), pss_data_dir(), h->sock_path, h->quiet_ns / PSS_NS_PER_MS,
 		h->burst_frames, h->burst_interval_ms, h->mic.k_imp, h->mic.k_voice, h->mic.warmup,
-		h->t_co_ns / PSS_NS_PER_MS, h->reburst_ns / PSS_NS_PER_MS, h->reburst_cap_ns / PSS_NS_PER_MS);
+		h->t_co_ns / PSS_NS_PER_MS, h->reburst_ns / PSS_NS_PER_MS, h->reburst_cap_ns / PSS_NS_PER_MS,
+		h->tune ? " tune=on" : "");
 
 	for (;;) {
 		struct epoll_event evs[16];

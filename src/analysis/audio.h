@@ -9,7 +9,8 @@
  * flux, an exponentially weighted mean and variance with a ~60 s time
  * constant. Frames are scored as z-scores against it. The caller decides
  * when it learns (only while no event is open), and frames that are part of
- * an impulse are never learned.
+ * an impulse, or sudden at all (flux z >= k_imp, e.g. a beep), are never
+ * learned.
  *
  * Impulse (latch, door): flux z >= k_imp, broadband (at least
  * AUDIO_BROAD_MIN of the 8 bands at z >= AUDIO_BAND_Z), and the mean band
@@ -45,11 +46,38 @@ enum {
 	AUDIO_VOICE = 4,	/* voice is detected (every frame while it is) */
 };
 
+/*
+ * Tuning (hub --tune logs these; they never change a decision). A sound
+ * "comes close" when its flux z reaches k_imp / 2; a second of sound comes
+ * close when its largest speech-band z reaches AUDIO_TUNE_VOICE_Z (above
+ * the jitter of a steady room, so a quiet room logs nothing).
+ */
+#define AUDIO_TUNE_VOICE_Z 2.5
+enum audio_tune_imp {
+	AUDIO_TUNE_NONE = 0,
+	AUDIO_TUNE_YES,		/* confirmed impulse */
+	AUDIO_TUNE_NO_FLUX,	/* flux z below k_imp */
+	AUDIO_TUNE_NO_BROAD,	/* fewer than AUDIO_BROAD_MIN bands jumped */
+	AUDIO_TUNE_NO_DECAY,	/* didn't fall AUDIO_DECAY_DB within 140 ms */
+};
+
 struct audio_result {
 	unsigned flags;
 	int64_t impulse_ns;	/* time of the loud frame */
 	double impulse_z;	/* its flux z */
 	double voice_z;		/* this frame's speech-band mean z */
+	/* impulse verdict on a sound that came close (else AUDIO_TUNE_NONE) */
+	enum audio_tune_imp tune_imp;
+	double tune_imp_z;	/* flux z of the loud frame */
+	int tune_imp_bands;	/* bands at z >= AUDIO_BAND_Z */
+	double tune_fall_db;	/* YES: fall when confirmed; NO_DECAY: most it fell */
+	int tune_fall_ms;	/* YES: how soon it fell */
+	/* once per second (50 frames) of sound that came close */
+	int tune_voice;
+	double tune_vz_max;	/* largest speech-band mean z in that second */
+	double tune_low_z;	/* band 0's z in that same frame */
+	uint32_t tune_counted;	/* frames that counted as voice in that second */
+	uint32_t tune_window;	/* frames counted in the last 2 s (needs AUDIO_VOICE_MIN) */
 };
 
 struct audio {
@@ -62,11 +90,15 @@ struct audio {
 	int imp_pending;
 	uint32_t imp_age;
 	int64_t imp_ns;
-	double imp_level, imp_z;
+	double imp_level, imp_z, imp_min_level;
+	int imp_bands;
 	/* voice: 1 per frame that sounded like voice, last AUDIO_VOICE_WIN frames */
 	uint8_t voice_win[AUDIO_VOICE_WIN];
 	uint32_t voice_pos, voice_count;
 	int voice_active;
+	/* tuning: the current second */
+	uint32_t sec_frames, sec_counted;
+	double sec_vz_max, sec_low_z;
 	/* largest scores seen while learning, for tuning; reset by the caller */
 	double imp_zmax, voice_zmax;
 };

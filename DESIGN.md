@@ -157,7 +157,9 @@ As built (`src/analysis/audio.c`; Bryan, 2026-11-18). micd's band edges are
   below 100 Hz is measured) rose less than they did. Voice is detected while
   ≥ 20 of the last 100 frames count. It feeds fusion on every frame while it
   lasts, so talking keeps an event open (T_quiet below).
-- Frames that are part of an impulse are never learned into the background.
+- Frames that are part of an impulse, or sudden at all (flux z ≥ `K_imp`,
+  e.g. a beep), are never learned into the background. A learned beep
+  would inflate the flux variance and hide a door click for about a minute.
 - Change from "updated only outside active events" (Bryan, 2026-11-18): the
   background also keeps learning during a SOUND_ONLY event and stops only
   once the event has motion. Otherwise a TV or radio switched on while armed

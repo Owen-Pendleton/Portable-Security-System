@@ -180,6 +180,9 @@ pird: start pid=1696 chip=/dev/gpiochip0 line=17 mode=irq level=0; warm-up, edge
   does, so the impulse can see its decay. Still to do: tune `K_imp` and
   `K_voice` on the Pi (door, talking, TV, HVAC) from the heartbeat's
   `imp_zmax` / `voice_zmax`.
+- `hub --tune` (Bryan, 2026-11-18): logs each sound that comes close to a
+  threshold with its scores and the reason it did or didn't count. Pi
+  tuning steps are in DONEXT.md.
 - Background keeps learning during SOUND_ONLY events, freezing only once
   there is motion (Bryan, 2026-11-18; DESIGN.md Section 4). e2e
   `test_tv_fades_into_background` fails without it (the event never

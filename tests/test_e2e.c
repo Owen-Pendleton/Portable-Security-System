@@ -862,7 +862,8 @@ static void test_tv_fades_into_background(void)
 	setenv("PSS_RUN_DIR", run, 1);
 	snprintf(hub, sizeof hub, "%s/hub", bindir);
 
-	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--warmup-frames=50", "--exit-delay-ms=200", NULL });
+	/* --tune only adds log lines; the checks below are the same with it. */
+	hp = spawn((char *[]){ hub, "--quiet-ms=300", "--warmup-frames=50", "--exit-delay-ms=200", "--tune", NULL });
 	CHECK(hp > 0);
 	CHECK(ipc_sock_path(sock, sizeof sock) == 0);
 	pfd = connect_as(sock, PSS_ROLE_PIR);	/* only to press the arm button */

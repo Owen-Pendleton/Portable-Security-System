@@ -85,6 +85,36 @@ than 5 min, then check `ls --full-time /var/lib/pss/clips/<id>.dir`.
 Expect 5 bursts about a minute apart (`img*`, `b2-` to `b5-`) and
 `pss events` showing the summed image count.
 
+## NEXT: tune the sound detectors on the Pi (Owen, then Bryan)
+The impulse (door) and voice detectors are in (`src/analysis/audio.c`,
+DESIGN.md Section 4). Their thresholds `--k-imp=6` and `--k-voice=3` are
+guesses. `hub --tune` logs a line for every sound that comes close, with
+its scores and why it did or didn't count, for example:
+```
+tune: impulse? flux z=9.1 (k_imp 6), 6/8 bands, fell 14 dB in 60 ms -> YES
+tune: impulse? flux z=7.4 (k_imp 6), 3/8 bands -> no (not broadband, needs 5)
+tune: voice? last 1 s: speech z max=4.2 (k_voice 3), low band z=1.0, 31 frames counted, 31/100 in 2 s (needs 20)
+```
+Steps:
+1. `git pull && make`. In `deploy/pss.conf` change the hub line to
+   `hub    hub --tune`, then `sudo systemctl restart pss`.
+2. Leave it **disarmed** (don't press the button): every sound is still
+   scored and logged, but nothing is recorded and the camera never fires.
+3. Wait 2 minutes in a quiet room so it learns the room.
+4. `journalctl -u pss -f 2>&1 | tee ~/tune.txt`
+5. Make each sound about 5 times, a few seconds apart, and write down the
+   clock time you start each kind:
+   - should count: open and close the room door; normal talking ~10 s,
+     near and across the room; quiet talking
+   - should not: heating/AC switching on (most important: it can also
+     fool the PIR); a fan; footsteps; a phone beep; music; a cough
+6. Send Bryan `~/tune.txt` and the list of times, as text files.
+7. Remove `--tune` from `pss.conf` and restart.
+
+Bryan's session then picks the thresholds from the scores, sets them in
+`pss.conf`, and asks for a short armed check (walk in through the door:
+ENTRY with photos; AC switching on: nothing).
+
 ## Other open items (from M4-Status.md)
 - **LED** (GPIO22, pin 15, not bought). Proposed: the hub sends an LED
   message (off / on / blink) and pird does the blinking. Pattern
